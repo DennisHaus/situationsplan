@@ -49,7 +49,7 @@ const SHADOW_FACTOR = 0.55;     // Schattenlänge = Höhe × Faktor
 const COL = {
   carriage: '#c9c9c6', sidewalk: '#e1e1de', edge: '#7c7c78', curb: '#a2a29e', paved: '#e1e1de',
   grass: '#dce8cf', grassEdge: '#a6bf98', forest: '#c3d7b3', forestEdge: '#8cab7d',
-  water: '#d0e2ec', waterEdge: '#85a8bd', parcel: '#2b2b2b',
+  water: '#d0e2ec', waterEdge: '#85a8bd', parcel: '#2b2b2b', ground: '#eeeeeb',
   treeEdge: '#4f6f45', shadow: '#1d2630'
 };
 
@@ -58,7 +58,8 @@ const $ = id => document.getElementById(id);
 const ui = {
   width: $('width'), height: $('height'), scale: $('scale'), dpi: $('dpi'),
   style: $('style'), optRoof: $('optRoof'), optShadow: $('optShadow'), optTexture: $('optTexture'),
-  optTerrain: $('optTerrain'), sun: $('sun'),
+  optTerrain: $('optTerrain'), optGround: $('optGround'), sun: $('sun'),
+  treeSize: $('treeSize'), treeVar: $('treeVar'),
   btnGenerate: $('btnGenerate'), btnPng: $('btnPng'), btnDxf: $('btnDxf'),
   status: $('status'), preview: $('preview'), planEmpty: $('planEmpty'),
   tabMap: $('tabMap'), tabPlan: $('tabPlan'), mapView: $('map'), planView: $('planView')
@@ -77,6 +78,9 @@ function renderOpts() {
     shadow: ui.optShadow.checked,
     texture: ui.optTexture.checked,
     terrain: ui.optTerrain.checked,
+    ground: ui.optGround.checked,
+    treeSize: clamp(parseFloat(ui.treeSize.value) || 7, 2, 20),
+    treeVar: clamp((parseFloat(ui.treeVar.value) || 0) / 100, 0, 1),
     sun: ui.sun.value
   };
 }
@@ -148,7 +152,7 @@ function applyStylePreset() {
   ui.optShadow.checked = detail;
   ui.optTexture.checked = detail;
   ui.optTerrain.checked = detail;
-  setTreeStyle(detail ? 'flat' : 'circle');
+  setTreeStyle(detail ? 'flat_x' : 'circle');
 }
 
 function setTreeStyle(id) {
@@ -157,34 +161,52 @@ function setTreeStyle(id) {
   if (el) el.checked = true;
 }
 
-// Auswahl mit kleinen Vorschaubildern
+// Auswahl als Raster: Zeilen = Familien, Spalten = Varianten
 function buildTreePicker() {
   const wrap = $('treeStyles');
   wrap.innerHTML = '';
   const dpr = window.devicePixelRatio || 1;
   const sun = sunVectors(ui.sun.value);
-  for (const st of TREE_STYLES) {
-    const lab = document.createElement('label');
-    lab.className = 'tree-opt';
-    const inp = document.createElement('input');
-    inp.type = 'radio'; inp.name = 'treeStyle'; inp.value = st.id;
-    inp.checked = st.id === treeStyle;
-    inp.addEventListener('change', () => { treeStyle = st.id; renderPreview(); });
-    const cv = document.createElement('canvas');
-    cv.width = cv.height = Math.round(44 * dpr);
-    const c = cv.getContext('2d');
-    drawTree(c, st.id, cv.width / 2, cv.height / 2, 17 * dpr, 7, v => v * 3.2 * dpr, sun);
-    const name = document.createElement('span');
-    name.textContent = st.label;
+  wrap.appendChild(document.createElement('span'));
+  for (const v of TREE_VARIANTS) {
+    const h = document.createElement('span');
+    h.className = 'tg-head';
+    h.textContent = v.label;
+    wrap.appendChild(h);
+  }
+  for (const fam of TREE_FAMILIES) {
+    const row = document.createElement('span');
+    row.className = 'tg-row';
+    row.textContent = fam.label;
     const kind = document.createElement('span');
-    kind.className = 'kind';
-    kind.textContent = st.kind;
-    lab.append(inp, cv, name, kind);
-    wrap.appendChild(lab);
+    kind.textContent = fam.kind;
+    row.appendChild(kind);
+    wrap.appendChild(row);
+    for (const v of TREE_VARIANTS) {
+      const id = v.id ? `${fam.id}_${v.id}` : fam.id;
+      const lab = document.createElement('label');
+      lab.className = 'tree-opt';
+      lab.title = `${fam.label}, ${v.label}`;
+      const inp = document.createElement('input');
+      inp.type = 'radio'; inp.name = 'treeStyle'; inp.value = id;
+      inp.checked = id === treeStyle;
+      inp.setAttribute('aria-label', `${fam.label}, ${v.label}`);
+      inp.addEventListener('change', () => { treeStyle = id; renderPreview(); });
+      const cv = document.createElement('canvas');
+      cv.width = cv.height = Math.round(48 * dpr);
+      const c = cv.getContext('2d');
+      c.fillStyle = '#fff';
+      c.fillRect(0, 0, cv.width, cv.height);
+      const r = 6, pxPerM = 19 * dpr / r;
+      drawTree(c, id, cv.width / 2, cv.height / 2, r, 11, pxPerM, mmv => mmv * 3.4 * dpr, sun);
+      lab.append(inp, cv);
+      wrap.appendChild(lab);
+    }
   }
 }
 ui.style.addEventListener('change', () => { applyStylePreset(); renderPreview(); });
-[ui.optRoof, ui.optShadow, ui.optTexture, ui.optTerrain].forEach(el => el.addEventListener('change', renderPreview));
+[ui.optRoof, ui.optShadow, ui.optTexture, ui.optTerrain, ui.optGround, ui.treeSize].forEach(el => el.addEventListener('change', renderPreview));
+ui.treeVar.addEventListener('input', () => { clearTimeout(ui.treeVar._t); ui.treeVar._t = setTimeout(renderPreview, 120); });
 ui.optTerrain.addEventListener('change', () => {
   if (ui.optTerrain.checked && state.plan && !state.plan.terrain) setStatus('Für die Geländeschattierung den Plan neu erzeugen.');
 });
@@ -1038,11 +1060,17 @@ async function generate() {
     if (opts.trees) {
       for (const t of data.trees) {
         const [e, n] = toLV([t.lon, t.lat]);
-        const d0 = parseFloat(t.tags.diameter_crown);
-        const d = d0 > 0.5 && d0 < 40 ? d0 : DEFAULT_TREE_CROWN;
-        if (e < bbox[0] - d || e > bbox[2] + d || n < bbox[1] - d || n > bbox[3] + d) continue;
+        if (e < bbox[0] - 20 || e > bbox[2] + 20 || n < bbox[1] - 20 || n > bbox[3] + 20) continue;
+        const dc = parseFloat(t.tags.diameter_crown);
         const h = parseFloat(t.tags.height);
-        plan.trees.push({ e, n, d, h: h > 0 && h < 60 ? h : d * 1.6, seed: Math.abs(Math.floor(e * 13 + n * 7)) });
+        const h0 = h > 0 && h < 60 ? h : 0;
+        const d0 = dc > 0.5 && dc < 40 ? dc : h0 ? clamp(h0 * 0.55, 3, 18) : 0;
+        const ie = Math.round(e * 10), in_ = Math.round(n * 10);
+        plan.trees.push({
+          e, n, d0, h0, rv: hash2(ie, in_, 7),
+          conifer: t.tags.leaf_type === 'needleleaved',
+          seed: Math.abs(Math.floor(e * 13 + n * 7))
+        });
       }
     }
 
@@ -1191,173 +1219,205 @@ function mottle(c, W, H, cell, seed, dark, light, amp) {
 
 /* ---------- Bäume ---------- */
 
-// Angelehnt an gängige Darstellungen in Situationsplänen:
-// drei gerenderte Varianten (Bild) und zwei reine Strichzeichnungen (Vektor)
-const TREE_STYLES = [
+// Drei Familien mit je drei Varianten: einfach, komplex, Grundriss (Stamm geschnitten, Krone gestrichelt).
+// Stil-ID: Familie + Variante, z.B. 'grey_x' oder 'circle_plan'.
+const TREE_FAMILIES = [
   { id: 'flat', label: 'Flach', kind: 'Bild' },
   { id: 'grey', label: 'Grau', kind: 'Bild' },
-  { id: 'fine', label: 'Laub', kind: 'Bild' },
-  { id: 'circle', label: 'Kreis', kind: 'Vektor' },
-  { id: 'branch', label: 'Astwerk', kind: 'Vektor' }
+  { id: 'circle', label: 'Kreis', kind: 'Vektor' }
 ];
-const RASTER_TREES = new Set(['flat', 'grey', 'fine']);
-const MULTIPLY_TREES = new Set(['flat', 'grey']); // Überlappungen dunkeln ab wie Marker
+const TREE_VARIANTS = [
+  { id: '', label: 'Einfach' },
+  { id: 'x', label: 'Komplex' },
+  { id: 'plan', label: 'Grundriss' }
+];
 let treeStyle = 'flat';
-const spriteCache = new Map();
 
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
-function treeSprite(style, rpx, variant, sun) {
-  const rb = Math.max(4, Math.round(rpx / 3) * 3);
-  const key = `${style}|${rb}|${variant}|${sun.toSun.join()}`;
-  let sp = spriteCache.get(key);
-  if (sp) return sp;
-  if (spriteCache.size > 500) spriteCache.clear();
-  const pad = Math.ceil(rb * 0.12) + 2, S = 2 * (rb + pad);
-  const cv = document.createElement('canvas');
-  cv.width = cv.height = S;
-  const c = cv.getContext('2d');
-  const rnd = mulberry32(variant * 7919 + rb * 31 + style.length * 1013);
-  const lx = sun.toSun[0], ly = -sun.toSun[1];
-  if (style === 'flat') paintFlat(c, S / 2, S / 2, rb, rnd, lx, ly);
-  else if (style === 'grey') paintGrey(c, S / 2, S / 2, rb, rnd, lx, ly);
-  else paintFine(c, S / 2, S / 2, rb, rnd, lx, ly);
-  sp = { canvas: cv, scale: rpx / rb };
-  spriteCache.set(key, sp);
-  return sp;
-}
-
-// Leicht unregelmässiger Kronenumriss
-function crownPath(c, cx, cy, rad, amp, rnd) {
-  const p1 = rnd() * 6.3, p2 = rnd() * 6.3;
-  c.beginPath();
-  for (let i = 0; i <= 90; i++) {
-    const a = i / 90 * Math.PI * 2;
-    const k = rad * (1 + amp * (0.6 * Math.sin(5 * a + p1) + 0.4 * Math.sin(9 * a + p2)));
-    const x = cx + Math.cos(a) * k, y = cy + Math.sin(a) * k;
-    i ? c.lineTo(x, y) : c.moveTo(x, y);
-  }
-  c.closePath();
-}
-
-// Flache, ruhige Krone in gedecktem Grün mit feinen Innenbögen
-function paintFlat(c, cx, cy, R, rnd, lx, ly) {
-  crownPath(c, cx, cy, R * 0.97, 0.02, rnd);
-  const g = c.createRadialGradient(cx + lx * R * 0.4, cy + ly * R * 0.4, R * 0.05, cx, cy, R);
-  g.addColorStop(0, 'rgb(190,207,168)');
-  g.addColorStop(1, 'rgb(146,170,128)');
-  c.fillStyle = g;
-  c.fill();
-  c.lineWidth = Math.max(1, R * 0.035);
-  c.strokeStyle = 'rgb(92,118,82)';
-  c.stroke();
-  c.lineCap = 'round';
-  c.strokeStyle = 'rgba(92,118,82,0.45)';
-  c.lineWidth = Math.max(0.7, R * 0.022);
-  for (let i = 0; i < 5; i++) {
-    const rr = R * (0.32 + rnd() * 0.45), a0 = rnd() * Math.PI * 2;
-    c.beginPath(); c.arc(cx, cy, rr, a0, a0 + 0.7 + rnd() * 0.9); c.stroke();
-  }
-  c.fillStyle = 'rgb(92,118,82)';
-  c.beginPath(); c.arc(cx, cy, Math.max(1, R * 0.05), 0, Math.PI * 2); c.fill();
-}
-
-// Transparente graue Krone, wie in Schwarzplänen üblich
-function paintGrey(c, cx, cy, R, rnd, lx, ly) {
-  crownPath(c, cx, cy, R * 0.98, 0.012, rnd);
-  c.fillStyle = 'rgba(150,150,146,0.5)';
-  c.fill();
-  c.lineWidth = Math.max(1, R * 0.03);
-  c.strokeStyle = 'rgba(64,64,62,0.85)';
-  c.stroke();
-  // heller Glanzbogen auf der Lichtseite
-  const a = Math.atan2(ly, lx);
-  c.lineCap = 'round';
-  c.strokeStyle = 'rgba(255,255,255,0.55)';
-  c.lineWidth = Math.max(1, R * 0.06);
-  c.beginPath(); c.arc(cx, cy, R * 0.72, a - 0.7, a + 0.7); c.stroke();
-  c.fillStyle = 'rgba(64,64,62,0.9)';
-  c.beginPath(); c.arc(cx, cy, Math.max(1, R * 0.05), 0, Math.PI * 2); c.fill();
-}
-
-// Feines Laub in gedeckten Tönen, klare Büschel ohne Weichzeichnung
-function paintFine(c, cx, cy, R, rnd, lx, ly) {
-  crownPath(c, cx, cy, R * 0.9, 0.03, rnd);
-  c.fillStyle = 'rgb(100,124,90)';
-  c.fill();
-  const n = Math.min(170, Math.round(40 + R * 1.2));
-  const blobs = [];
-  for (let i = 0; i < n; i++) {
-    const a = rnd() * Math.PI * 2, d = R * 0.86 * Math.sqrt(rnd());
-    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
-    const lit = ((x - cx) * lx + (y - cy) * ly) / R + (rnd() - 0.5) * 0.45;
-    blobs.push({ x, y, r: R * (0.09 + rnd() * 0.08), lit });
-  }
-  blobs.sort((p, q) => p.lit - q.lit);
-  for (const b of blobs) {
-    const col = mix([94, 118, 84], [192, 206, 164], Math.max(0, Math.min(1, (b.lit + 1) / 2)));
-    c.fillStyle = rgba(col, 1);
-    c.beginPath(); c.arc(b.x, b.y, b.r, 0, Math.PI * 2); c.fill();
-    c.fillStyle = rgba(mix(col, [240, 244, 222], 0.35), 0.8);
-    c.beginPath(); c.arc(b.x + lx * b.r * 0.3, b.y + ly * b.r * 0.3, b.r * 0.55, 0, Math.PI * 2); c.fill();
-  }
-  crownPath(c, cx, cy, R * 0.97, 0.03, rnd);
-  c.lineWidth = Math.max(0.8, R * 0.02);
-  c.strokeStyle = 'rgba(70,92,62,0.55)';
-  c.stroke();
-}
-
-// Vektorbäume relativ zum Stammpunkt (y nach oben). lines: [a, b, Stufe]
-function treeVector(style, r, seed) {
-  const rnd = mulberry32(seed + 17);
-  if (style === 'circle') {
-    const k = r * 0.12;
-    return { circles: [r], lines: [[[-k, 0], [k, 0], 1], [[0, -k], [0, k], 1]] };
-  }
-  const lines = [];
-  const grow = (p, ang, len, level) => {
-    const q = [p[0] + Math.cos(ang) * len, p[1] + Math.sin(ang) * len];
-    lines.push([p, q, level]);
-    if (level >= 3) return;
-    const n = level === 0 ? 2 + (rnd() < 0.5 ? 1 : 0) : 2;
-    for (let k = 0; k < n; k++) {
-      const da = (k - (n - 1) / 2) * (0.5 + rnd() * 0.25) + (rnd() - 0.5) * 0.2;
-      grow(q, ang + da, len * (0.62 + rnd() * 0.12), level + 1);
+// Kronenumriss aus unregelmässigen Bögen (verschieden breite und tiefe Ausbuchtungen)
+function lobedOutline(r, rnd, amp = 1) {
+  const n = 7 + Math.floor(rnd() * 5);
+  const widths = Array.from({ length: n }, () => 0.6 + rnd() * 0.8);
+  const sum = widths.reduce((x, y) => x + y, 0);
+  let a = rnd() * Math.PI * 2;
+  const pts = [];
+  for (let k = 0; k < n; k++) {
+    const wk = widths[k] / sum * Math.PI * 2;
+    const rk = r * (0.87 + rnd() * 0.11);
+    const depth = (0.06 + rnd() * 0.07) * amp;
+    const m = Math.max(6, Math.round(wk * 16));
+    for (let j = 0; j < m; j++) {
+      const u = j / m, ang = a + wk * u;
+      const rr = rk * (1 - depth + depth * Math.pow(Math.sin(Math.PI * u), 0.6)) + r * 0.006 * (rnd() - 0.5);
+      pts.push([Math.cos(ang) * rr, Math.sin(ang) * rr]);
     }
-  };
-  const mains = 5 + Math.floor(rnd() * 2), ph = rnd() * Math.PI * 2;
-  for (let m = 0; m < mains; m++) {
-    const a = ph + m * Math.PI * 2 / mains + (rnd() - 0.5) * 0.4;
-    grow([Math.cos(a) * r * 0.05, Math.sin(a) * r * 0.05], a, r * 0.36, 0);
+    a += wk;
   }
-  return { circles: [r], lines };
+  pts.push(pts[0]);
+  return pts;
 }
 
-function drawTree(c, style, x, y, rpx, seed, mm, sun) {
-  if (RASTER_TREES.has(style)) {
-    const sp = treeSprite(style, rpx, seed % 4, sun);
-    const S = sp.canvas.width * sp.scale;
-    c.save();
-    if (MULTIPLY_TREES.has(style)) c.globalCompositeOperation = 'multiply';
-    c.drawImage(sp.canvas, x - S / 2, y - S / 2, S, S);
-    c.restore();
-    return;
+// Gewachsenes Astwerk: unregelmässige Hauptäste, leicht gebogen, mit einseitigen Seitenzweigen
+function organicBranches(r, rnd) {
+  const lines = [];
+  const curve = (start, ang, len, lv, steps) => {
+    const pts = [start];
+    let p = start, a = ang;
+    const bend = (rnd() - 0.5) * 0.9;
+    for (let s = 0; s < steps; s++) {
+      a += bend / steps + (rnd() - 0.5) * 0.16;
+      const q = [p[0] + Math.cos(a) * len / steps, p[1] + Math.sin(a) * len / steps];
+      if (Math.hypot(q[0], q[1]) > r * 0.92) break;
+      pts.push(q);
+      p = q;
+    }
+    if (pts.length > 1) lines.push({ pts, lv });
+    return pts;
+  };
+  const nMain = 4 + Math.floor(rnd() * 3), ph = rnd() * Math.PI * 2;
+  for (let m = 0; m < nMain; m++) {
+    const a = ph + m * Math.PI * 2 / nMain + (rnd() - 0.5) * (Math.PI * 2 / nMain) * 0.7;
+    const main = curve([Math.cos(a) * r * 0.04, Math.sin(a) * r * 0.04], a, r * (0.5 + rnd() * 0.32), 0, 8);
+    const nt = 1 + Math.floor(rnd() * 3);
+    for (let t = 0; t < nt && main.length > 3; t++) {
+      const idx = 2 + Math.floor(rnd() * (main.length - 3));
+      const p = main[idx], q = main[idx - 1];
+      const base = Math.atan2(p[1] - q[1], p[0] - q[0]);
+      const side = rnd() < 0.5 ? -1 : 1;
+      const twig = curve(p, base + side * (0.45 + rnd() * 0.5), r * (0.14 + rnd() * 0.22), 1, 4);
+      if (rnd() < 0.5 && twig.length > 2) {
+        const tp = twig[twig.length - 2];
+        curve(tp, base + side * (0.9 + rnd() * 0.4), r * (0.07 + rnd() * 0.08), 2, 3);
+      }
+    }
   }
-  const g = treeVector(style, rpx, seed);
+  return lines;
+}
+
+// Geometrie eines Baums in Metern relativ zum Stamm (y nach Norden)
+function treeGeom(style, r, seed) {
+  const [fam, v = ''] = style.split('_');
+  const rnd = mulberry32(seed + 17);
+  const g = {
+    fam, v, outline: null, inner: [], branches: [],
+    dashed: v === 'plan',
+    trunk: v === 'plan' ? clamp(r * 0.07, 0.15, 0.45) : 0,
+    cross: fam === 'circle' && v === '' ? r * 0.12 : 0
+  };
+  if (v === 'x') {
+    if (fam !== 'circle') g.outline = lobedOutline(r, rnd);
+    if (fam === 'flat') g.inner = [lobedOutline(r * 0.62, rnd, 0.8)];
+    if (fam !== 'flat') g.branches = organicBranches(r, rnd);
+  }
+  return g;
+}
+
+// Zeichnen. r in Metern, pxPerM für die Umrechnung, mm für Strichstärken auf Papier
+function drawTree(c, style, x, y, r, seed, pxPerM, mm, sun) {
+  const g = treeGeom(style, r, seed);
+  const R = r * pxPerM;
+  const lx = sun.toSun[0], ly = -sun.toSun[1];
+  const crown = () => {
+    c.beginPath();
+    if (g.outline) {
+      g.outline.forEach(([px, py], i) => i ? c.lineTo(x + px * pxPerM, y - py * pxPerM) : c.moveTo(x + px * pxPerM, y - py * pxPerM));
+      c.closePath();
+    } else c.arc(x, y, R, 0, Math.PI * 2);
+  };
+  const polyline = pts => {
+    c.beginPath();
+    pts.forEach(([px, py], i) => i ? c.lineTo(x + px * pxPerM, y - py * pxPerM) : c.moveTo(x + px * pxPerM, y - py * pxPerM));
+  };
+  const dash = g.dashed ? [mm(1.0), mm(0.6)] : [];
+
   c.save();
   c.lineCap = 'round';
-  c.beginPath(); c.arc(x, y, rpx, 0, Math.PI * 2);
-  c.fillStyle = 'rgba(255,255,255,0.6)'; c.fill();
-  c.strokeStyle = '#1f1f1e';
-  c.lineWidth = mm(style === 'circle' ? 0.15 : 0.1);
-  c.stroke();
-  const widths = style === 'circle' ? [0.1, 0.1] : [0.14, 0.1, 0.07, 0.05];
-  for (const [a, b, lv] of g.lines) {
-    c.lineWidth = Math.max(0.5, mm(widths[Math.min(lv, widths.length - 1)]));
-    c.beginPath(); c.moveTo(x + a[0], y - a[1]); c.lineTo(x + b[0], y - b[1]); c.stroke();
+  c.lineJoin = 'round';
+
+  if (g.fam === 'flat') {
+    c.save();
+    c.globalCompositeOperation = 'multiply';
+    crown();
+    const grad = c.createRadialGradient(x + lx * R * 0.4, y + ly * R * 0.4, R * 0.05, x, y, R);
+    grad.addColorStop(0, g.dashed ? 'rgb(214,226,198)' : 'rgb(190,207,168)');
+    grad.addColorStop(1, g.dashed ? 'rgb(180,200,164)' : 'rgb(146,170,128)');
+    c.fillStyle = grad;
+    c.fill();
+    c.restore();
+    if (g.inner.length) {
+      c.strokeStyle = 'rgba(92,118,82,0.5)';
+      c.lineWidth = mm(0.08);
+      for (const ring of g.inner) { polyline(ring); c.stroke(); }
+    }
+    crown();
+    c.setLineDash(dash);
+    c.strokeStyle = 'rgb(92,118,82)';
+    c.lineWidth = mm(g.outline ? 0.12 : 0.13);
+    c.stroke();
+    c.setLineDash([]);
+  } else if (g.fam === 'grey') {
+    c.save();
+    c.globalCompositeOperation = 'multiply';
+    crown();
+    c.fillStyle = g.dashed ? 'rgba(160,160,156,0.35)' : 'rgba(150,150,146,0.5)';
+    c.fill();
+    c.restore();
+    if (!g.dashed) {
+      const a = Math.atan2(ly, lx);
+      c.strokeStyle = 'rgba(255,255,255,0.55)';
+      c.lineWidth = Math.max(1, R * 0.06);
+      c.beginPath(); c.arc(x, y, R * 0.72, a - 0.7, a + 0.7); c.stroke();
+    }
+    c.strokeStyle = 'rgba(70,70,68,0.6)';
+    for (const b of g.branches) {
+      c.lineWidth = mm([0.12, 0.08, 0.06][b.lv]);
+      polyline(b.pts); c.stroke();
+    }
+    crown();
+    c.setLineDash(dash);
+    c.strokeStyle = 'rgba(64,64,62,0.85)';
+    c.lineWidth = mm(0.13);
+    c.stroke();
+    c.setLineDash([]);
+  } else {
+    crown();
+    c.fillStyle = 'rgba(255,255,255,0.6)';
+    c.fill();
+    c.setLineDash(dash);
+    c.strokeStyle = '#1f1f1e';
+    c.lineWidth = mm(g.dashed ? 0.13 : 0.15);
+    c.stroke();
+    c.setLineDash([]);
+    if (g.cross) {
+      const k = g.cross * pxPerM;
+      c.lineWidth = mm(0.1);
+      c.beginPath(); c.moveTo(x - k, y); c.lineTo(x + k, y); c.moveTo(x, y - k); c.lineTo(x, y + k); c.stroke();
+    }
+    for (const b of g.branches) {
+      c.lineWidth = mm([0.13, 0.08, 0.06][b.lv]);
+      polyline(b.pts); c.stroke();
+    }
+  }
+
+  // Stamm: geschnitten (Grundriss) oder als Punkt
+  if (g.trunk) {
+    c.beginPath(); c.arc(x, y, Math.max(mm(0.5), g.trunk * pxPerM), 0, Math.PI * 2);
+    c.fillStyle = '#111'; c.fill();
+  } else if (!g.cross) {
+    c.beginPath(); c.arc(x, y, Math.max(mm(0.25), R * 0.04), 0, Math.PI * 2);
+    c.fillStyle = g.fam === 'flat' ? 'rgb(92,118,82)' : g.fam === 'grey' ? 'rgba(64,64,62,0.9)' : '#1f1f1e';
+    c.fill();
   }
   c.restore();
+}
+
+// Kronendurchmesser: aus den Daten, sonst aus der Baumhöhe, sonst Standard mit Variation
+function treeDiameter(t, o) {
+  if (t.d0) return t.d0;
+  const base = (o.treeSize || 7) * (t.conifer ? 0.65 : 1);
+  return Math.max(1.5, base * (1 + (o.treeVar || 0) * (t.rv - 0.5) * 1.4));
 }
 
 /* ---------- Wiesensignatur und Gelände ---------- */
@@ -1568,7 +1628,8 @@ function drawPlan(canvas, plan, dpi, o) {
     pts.forEach(([e, n], i) => i ? c.lineTo(X(e), Y(n)) : c.moveTo(X(e), Y(n)));
   };
 
-  ctx.fillStyle = '#ffffff';
+  // Restflächen (Höfe, Zwischenräume) hellgrau hinterlegen
+  ctx.fillStyle = o.ground ? COL.ground : '#ffffff';
   ctx.fillRect(0, 0, W, H);
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
@@ -1619,8 +1680,8 @@ function drawPlan(canvas, plan, dpi, o) {
       }
       c.setLineDash([]);
       c.lineCap = 'round';
-      // Fussgängerstreifen (in der Schweiz gelb)
-      c.fillStyle = '#efe0a0';
+      // Fussgängerstreifen
+      c.fillStyle = '#ffffff';
       for (const z of plan.zebras) {
         const nx = -z.dy, ny = z.dx;
         for (let t = -z.w / 2 + 0.25; t <= z.w / 2 - 0.25; t += 1.0) {
@@ -1658,9 +1719,10 @@ function drawPlan(canvas, plan, dpi, o) {
         }
       }
       for (const t of plan.trees) {
-        const len = t.h * SHADOW_FACTOR * 0.8 * pxPerM;
+        const d = treeDiameter(t, o);
+        const len = (t.h0 || d * 1.6) * SHADOW_FACTOR * 0.8 * pxPerM;
         c.beginPath();
-        c.arc(X(t.e) + sun.shadow[0] * len, Y(t.n) - sun.shadow[1] * len, t.d / 2 * pxPerM * 0.95, 0, Math.PI * 2);
+        c.arc(X(t.e) + sun.shadow[0] * len, Y(t.n) - sun.shadow[1] * len, d / 2 * pxPerM * 0.95, 0, Math.PI * 2);
         c.fill();
       }
     }, null, 0.2);
@@ -1670,7 +1732,7 @@ function drawPlan(canvas, plan, dpi, o) {
   fillStroke(ctx, plan.parcels, null, COL.parcel, mm(0.1));
 
   // Bäume
-  for (const t of plan.trees) drawTree(ctx, treeStyle, X(t.e), Y(t.n), t.d / 2 * pxPerM, t.seed, mm, sun);
+  for (const t of plan.trees) drawTree(ctx, treeStyle, X(t.e), Y(t.n), treeDiameter(t, o) / 2, t.seed, pxPerM, mm, sun);
 
   // Gebäude
   if (o.roof && plan.roofFaces.length) {
@@ -1979,6 +2041,7 @@ async function buildDXF(plan, o) {
     ['SCHATTEN', 9], ['SCHATTEN_FUELLUNG', 254],
     ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9], ['BAHN', 8], ['STRASSENNAMEN', 7],
     ['GRUEN', 3], ['WALD', 94], ['WASSER', 5], ['BAEUME', 94],
+    ['BAEUME_KRONE_GESTRICHELT', 94, 'DASHED'], ['BAEUME_AESTE', 94], ['BAEUME_STAMM', 7],
     ['PARZELLEN', 7], ['PARZELLEN_NR', 7]
   ];
   const dash = 1.2 * plan.scale / 1000, gap = 0.8 * plan.scale / 1000;
@@ -2113,12 +2176,28 @@ async function buildDXF(plan, o) {
 
   for (const t of plan.trees) {
     if (t.e < minE || t.e > maxE || t.n < minN || t.n > maxN) continue;
-    const r = t.d / 2;
-    g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r));
-    if (!RASTER_TREES.has(treeStyle)) {
-      for (const [a, b] of treeVector(treeStyle, r, t.seed).lines) line('BAEUME', [t.e + a[0], t.n + a[1]], [t.e + b[0], t.n + b[1]]);
+    const r = treeDiameter(t, o) / 2;
+    const gm = treeGeom(treeStyle, r, t.seed);
+    const crownLayer = gm.dashed ? 'BAEUME_KRONE_GESTRICHELT' : 'BAEUME';
+    const at = pts => pts.map(([x, y]) => [t.e + x, t.n + y]);
+    if (gm.outline) pline(crownLayer, at(gm.outline));
+    else { g(0, 'CIRCLE'); g(8, crownLayer); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r)); }
+    for (const ring of gm.inner) pline('BAEUME', at(ring));
+    if (gm.cross) {
+      line('BAEUME', [t.e - gm.cross, t.n], [t.e + gm.cross, t.n]);
+      line('BAEUME', [t.e, t.n - gm.cross], [t.e, t.n + gm.cross]);
     }
-    g(0, 'POINT'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0');
+    for (const b of gm.branches) plineOpen('BAEUME_AESTE', at(b.pts));
+    if (gm.trunk) {
+      const ring = Array.from({ length: 17 }, (_, i) => {
+        const a = i / 16 * Math.PI * 2;
+        return [t.e + Math.cos(a) * gm.trunk, t.n + Math.sin(a) * gm.trunk];
+      });
+      pline('BAEUME_STAMM', ring);
+      solids('BAEUME_STAMM', [ring]);
+    } else {
+      g(0, 'POINT'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0');
+    }
   }
 
   const nameH = 2.1 * plan.scale / 1000;

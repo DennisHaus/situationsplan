@@ -246,31 +246,45 @@ button.primary:disabled { background: #e7a3a5; border-color: #e7a3a5; color: #ff
 }
 .tree-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: auto repeat(3, 1fr);
   gap: 4px;
+  align-items: center;
 }
+.tg-head {
+  font-size: 0.68rem;
+  color: var(--muted);
+  text-align: center;
+}
+.tg-row {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding-right: 4px;
+  line-height: 1.15;
+}
+.tg-row span { display: block; font-weight: 400; color: var(--muted); font-size: 0.64rem; }
 .tree-opt {
   position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  padding: 4px 2px 3px;
+  justify-content: center;
+  padding: 3px;
   border: 1px solid var(--rule);
   cursor: pointer;
-  color: var(--ink);
-  font-size: 0.68rem;
-  text-align: center;
 }
 .tree-opt input {
   position: absolute;
   opacity: 0;
   pointer-events: none;
 }
-.tree-opt canvas { width: 44px; height: 44px; }
-.tree-opt .kind { color: var(--muted); font-size: 0.62rem; }
-.tree-opt:has(input:checked) { border: 2px solid var(--ink); padding: 3px 1px 2px; }
+.tree-opt canvas { width: 48px; height: 48px; }
+.tree-opt:has(input:checked) { border: 2px solid var(--ink); padding: 2px; }
 .tree-opt:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.row2 input[type="range"] { width: 100%; accent-color: var(--ink); margin: 8px 0 0; }
 
 /* ---------- Fortschritt ---------- */
 .progress {

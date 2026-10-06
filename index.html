@@ -73,10 +73,15 @@
           <label><input type="checkbox" id="optShadow" checked> Schattenwurf</label>
           <label><input type="checkbox" id="optTexture" checked> Texturen</label>
           <label><input type="checkbox" id="optTerrain" checked> Geländeschattierung auf Grünflächen</label>
+          <label><input type="checkbox" id="optGround" checked> Restflächen hellgrau hinterlegen</label>
         </div>
         <fieldset class="treepick">
           <legend>Bäume</legend>
           <div id="treeStyles" class="tree-grid" role="radiogroup" aria-label="Baumdarstellung"></div>
+          <div class="row2">
+            <label>Kronen-Ø ohne Angabe (m)<input id="treeSize" type="number" min="2" max="20" step="0.5" value="7"></label>
+            <label>Grössenvariation<input id="treeVar" type="range" min="0" max="100" value="60"></label>
+          </div>
         </fieldset>
         <label class="inline spaced">Schatten fallen
           <select id="sun">
