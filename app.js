@@ -356,6 +356,18 @@ ui.tabPlan.addEventListener('click', () => showTab('plan'));
    Daten holen
    ========================================================= */
 
+// Zwischenspeicher: derselbe Ausschnitt wird beim erneuten Erzeugen nicht neu geladen.
+// Fehlgeschlagene Abfragen werden nicht gespeichert.
+const dataCache = new Map();
+function cached(kind, box, loader) {
+  const key = kind + ':' + box.map(v => Math.round(v * 100000) / 100000).join(',');
+  if (dataCache.has(key)) return dataCache.get(key);
+  const p = loader().catch(err => { dataCache.delete(key); throw err; });
+  dataCache.set(key, p);
+  if (dataCache.size > 24) dataCache.delete(dataCache.keys().next().value);
+  return p;
+}
+
 async function fetchOverpass([s, w, n, e], hooks = {}) {
   const b = `(${s},${w},${n},${e})`;
   const q = `[out:json][timeout:90];
@@ -455,49 +467,68 @@ async function fetchParcels(bbox, onPage) {
 }
 
 // Dachflächen aus Sonnendach.ch (BFE): jede Dachfläche einzeln, mit Neigung und Ausrichtung.
-// Abfrage in Rasterzellen, damit pro Anfrage nicht zu viele Flächen zurückkommen.
+// Der Dienst liefert höchstens 50 Flächen pro Anfrage. Damit das Blättern nicht
+// nacheinander passiert, werden pro Zelle mehrere Seiten gleichzeitig vorausgeladen;
+// sobald eine Seite nicht mehr voll ist, ist die Zelle fertig.
 async function fetchRoofs(bbox, onProgress) {
-  const CELL = 120, LIMIT = 50;
+  const LIMIT = 50, CELL = 100, AHEAD = 3, WORKERS = 8;
   const cells = [];
   for (let e = bbox[0]; e < bbox[2]; e += CELL) {
     for (let n = bbox[1]; n < bbox[3]; n += CELL) {
-      cells.push([e, n, Math.min(e + CELL, bbox[2]), Math.min(n + CELL, bbox[3])]);
+      cells.push({ box: [e, n, Math.min(e + CELL, bbox[2]), Math.min(n + CELL, bbox[3])], next: 0, end: Infinity });
     }
   }
+  const queue = [];
+  const enqueue = (cell, k = AHEAD) => { while (k-- > 0) queue.push({ cell, page: cell.next++ }); };
+  cells.forEach(c => enqueue(c));
   const seen = new Map();
-  let done = 0, failed = 0;
-  const one = async cell => {
-    const [a, b, c, d] = cell.map(v => v.toFixed(1));
-    for (let page = 0; page < 40; page++) {
-      const url = 'https://api3.geo.admin.ch/rest/services/all/MapServer/identify' +
-        `?geometry=${a},${b},${c},${d}&geometryType=esriGeometryEnvelope` +
-        '&layers=all:ch.bfe.solarenergie-eignung-daecher' +
-        `&mapExtent=${a},${b},${c},${d}&imageDisplay=1000,1000,96&tolerance=0` +
-        '&sr=2056&returnGeometry=true&geometryFormat=geojson' +
-        `&limit=${LIMIT}&offset=${page * LIMIT}`;
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const j = await r.json();
-      const results = j.results || [];
-      let added = 0;
-      for (const f of results) {
-        const id = f.featureId != null ? f.featureId : f.id;
-        if (!seen.has(id)) { seen.set(id, f); added++; }
-      }
-      if (results.length < LIMIT || added === 0) break;
+  let finished = 0, failed = 0, active = 0;
+
+  const request = async ({ cell, page }) => {
+    const [a, b, c, d] = cell.box.map(v => v.toFixed(1));
+    const url = 'https://api3.geo.admin.ch/rest/services/all/MapServer/identify' +
+      `?geometry=${a},${b},${c},${d}&geometryType=esriGeometryEnvelope` +
+      '&layers=all:ch.bfe.solarenergie-eignung-daecher' +
+      `&mapExtent=${a},${b},${c},${d}&imageDisplay=1000,1000,96&tolerance=0` +
+      '&sr=2056&returnGeometry=true&geometryFormat=geojson' +
+      `&limit=${LIMIT}&offset=${page * LIMIT}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const results = (await r.json()).results || [];
+    let added = 0;
+    for (const f of results) {
+      const id = f.featureId != null ? f.featureId : f.id;
+      if (!seen.has(id)) { seen.set(id, f); added++; }
     }
+    // Eine nicht volle Seite markiert das Ende der Zelle. Volle Seiten ohne neue
+    // Flächen heissen, dass der Dienst kein Blättern kann: dann ebenfalls Ende.
+    if (results.length < LIMIT || (added === 0 && results.length)) cell.end = Math.min(cell.end, page);
+    // letzte vorausgeladene Seite war voll: weitere Seiten nachschieben;
+    // freie Abfrage-Plätze bekommt die Zelle, die noch Daten hat
+    else if (page === cell.next - 1 && page < 200) enqueue(cell, Math.max(AHEAD, WORKERS - queue.length - active + 1));
   };
-  const queue = [...cells];
+
   const worker = async () => {
-    while (queue.length) {
-      const cell = queue.shift();
-      try { await one(cell); } catch (e) { failed++; }
-      done++;
-      if (onProgress) onProgress(done / cells.length, seen.size);
+    for (;;) {
+      let task = queue.shift();
+      while (task && task.page > task.cell.end) task = queue.shift(); // Seiten hinter dem Ende überspringen
+      if (!task) {
+        if (active === 0) return;
+        await new Promise(r => setTimeout(r, 25));
+        continue;
+      }
+      active++;
+      try { await request(task); } catch (e) { failed++; }
+      active--;
+      finished++;
+      if (onProgress) {
+        const open = cells.filter(c => c.end === Infinity).length;
+        onProgress((cells.length - open) / cells.length * 0.7 + finished / (finished + queue.length + active) * 0.3, seen.size);
+      }
     }
   };
-  await Promise.all([worker(), worker(), worker(), worker()]);
-  if (failed === cells.length) throw new Error('Dachdaten nicht erreichbar');
+  await Promise.all(Array.from({ length: WORKERS }, worker));
+  if (failed && failed === finished) throw new Error('Dachdaten nicht erreichbar');
   return [...seen.values()];
 }
 
@@ -1038,24 +1069,24 @@ async function generate() {
     if (!swiss) warnings.push('Ausserhalb der Schweiz: Parzellen, echte Dachformen und Geländeschattierung sind hier noch nicht verfügbar.');
     const [osm, parcelsRaw, roofsRaw, terrain] = await Promise.all([
       needOsm
-        ? fetchOverpass(wgsBox, {
+        ? cached('osm', wgsBox, () => fetchOverpass(wgsBox, {
             onHeaders: total => { load.phase = 'bytes'; load.total = total; },
             onBytes: n => { load.received = n; },
             onRetry: () => { load.phase = 'wait'; load.received = 0; load.t0 = performance.now(); }
-          }).then(r => { load.osmDone = true; return r; })
+          })).then(r => { load.osmDone = true; return r; })
         : Promise.resolve({ elements: [] }),
       needParcels
-        ? fetchParcels(bbox, n => { load.pages = n; })
+        ? cached('parcels', bbox, () => fetchParcels(bbox, n => { load.pages = n; }))
             .catch(err => { warnings.push('Parzellen nicht verfügbar (' + err.message + ').'); return []; })
             .then(r => { load.parcDone = true; return r; })
         : Promise.resolve([]),
       needRoofs
-        ? fetchRoofs(roofBox, (frac, count) => { load.roofFrac = frac; load.roofCount = count; })
+        ? cached('roofs', roofBox, () => fetchRoofs(roofBox, (frac, count) => { load.roofFrac = frac; load.roofCount = count; }))
             .catch(err => { warnings.push('Echte Dachformen nicht verfügbar, Dächer schematisch (' + err.message + ').'); return []; })
             .then(r => { load.roofDone = true; return r; })
         : Promise.resolve([]),
       needTerrain
-        ? fetchTerrain(bbox, frac => { load.terrFrac = frac; })
+        ? cached('terrain', bbox, () => fetchTerrain(bbox, frac => { load.terrFrac = frac; }))
             .catch(err => { warnings.push('Höhenmodell nicht verfügbar, ohne Geländeschattierung (' + err.message + ').'); return null; })
             .then(r => { load.terrDone = true; return r; })
         : Promise.resolve(null)
@@ -1972,7 +2003,7 @@ async function fetchTerrain(bbox, onProgress) {
       if (onProgress) onProgress(done / rows);
     }
   };
-  await Promise.all([worker(), worker(), worker(), worker()]);
+  await Promise.all(Array.from({ length: 6 }, worker));
   if (okRows.size < rows / 2) throw new Error('Höhendaten nicht erreichbar');
   for (let j = 0; j < rows; j++) {
     if (okRows.has(j)) continue;
