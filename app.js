@@ -8,10 +8,10 @@
    ========================================================= */
 
 /* ---------- Freiwilliger Beitrag ----------
-   Hier deinen PayPal.me-Namen eintragen (der Teil nach paypal.me/).
-   Solange der Platzhalter steht, zeigt das Fenster einen Hinweis statt Links. */
+   PayPal-Spendenlink. Betrag und Währung werden angehängt; je nach Einstellung
+   des Spendenbuttons übernimmt PayPal den Betrag oder man gibt ihn dort ein. */
 const DONATE = {
-  paypalMe: 'DEIN-PAYPAL-NAME',
+  url: 'https://www.paypal.com/donate/?hosted_button_id=6L6ZGY48FR7A6',
   currency: 'EUR',
   amounts: [2, 5, 10, 50]
 };
@@ -101,10 +101,15 @@ function setStatus(msg, isError = false) {
 
 /* ---------- Karte ---------- */
 const map = L.map('map', { zoomControl: true }).setView([47.3769, 8.5417], 17);
-L.tileLayer(
+const baseOsm = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 20, maxNativeZoom: 19,
+  attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'
+}).addTo(map);
+const baseSwiss = L.tileLayer(
   'https://wmts.geo.admin.ch/1.0.0/ch.swisstopo.pixelkarte-grau/default/current/3857/{z}/{x}/{y}.jpeg',
   { maxZoom: 20, maxNativeZoom: 18, attribution: '© swisstopo' }
-).addTo(map);
+);
+L.control.layers({ 'OpenStreetMap': baseOsm, 'swisstopo grau (nur CH)': baseSwiss }, null, { position: 'topright' }).addTo(map);
 
 const perimeter = L.polygon([], {
   color: '#d7141a', weight: 2, dashArray: '6 4', fillOpacity: 0.05
@@ -295,27 +300,45 @@ ui.optRoof.addEventListener('change', () => {
   }
 });
 
-/* ---------- Ortssuche (geo.admin.ch) ---------- */
+/* ---------- Ortssuche: geo.admin.ch für die Schweiz, sonst OpenStreetMap (Nominatim) ---------- */
+async function searchPlace(q) {
+  try {
+    const url = 'https://api3.geo.admin.ch/rest/services/api/SearchServer' +
+      `?searchText=${encodeURIComponent(q)}&type=locations&limit=1&sr=4326`;
+    const res = await fetch(url).then(r => r.json());
+    const a = res.results && res.results[0] && res.results[0].attrs;
+    if (a) return { lat: a.lat, lon: a.lon, label: stripTags(a.label || q) };
+  } catch (e) { /* weiter mit Nominatim */ }
+  const url = 'https://nominatim.openstreetmap.org/search' +
+    `?format=jsonv2&limit=1&accept-language=de&q=${encodeURIComponent(q)}`;
+  const res = await fetch(url).then(r => r.json());
+  const hit = res && res[0];
+  return hit ? { lat: +hit.lat, lon: +hit.lon, label: hit.display_name } : null;
+}
+
 $('searchForm').addEventListener('submit', async ev => {
   ev.preventDefault();
   const q = $('searchInput').value.trim();
   if (!q) return;
   setStatus('Suche läuft …');
   try {
-    const url = 'https://api3.geo.admin.ch/rest/services/api/SearchServer' +
-      `?searchText=${encodeURIComponent(q)}&type=locations&limit=1&sr=4326`;
-    const res = await fetch(url).then(r => r.json());
-    const a = res.results && res.results[0] && res.results[0].attrs;
-    if (!a) { setStatus(`Kein Treffer für «${q}».`, true); return; }
-    state.center = toLV([a.lon, a.lat]);
-    map.setView([a.lat, a.lon], 18);
+    const hit = await searchPlace(q);
+    if (!hit) { setStatus(`Kein Treffer für «${q}».`, true); return; }
+    state.center = toLV([hit.lon, hit.lat]);
+    map.setView([hit.lat, hit.lon], 18);
     updatePerimeter();
     invalidatePlan();
-    setStatus(stripTags(a.label || q));
+    setStatus(hit.label);
   } catch (err) {
     setStatus('Suche fehlgeschlagen: ' + err.message, true);
   }
 });
+
+// Grobe Prüfung, ob der Ausschnitt in der Schweiz liegt (Rechteck der Landesvermessung).
+// Ausserhalb werden die Schweizer Dienste (Parzellen, Dächer, Gelände) übersprungen.
+function inSwitzerland([minE, minN, maxE, maxN]) {
+  return minE < 2834000 && maxE > 2485000 && minN < 1296000 && maxN > 1075000;
+}
 
 /* ---------- Tabs ---------- */
 function showTab(which) {
@@ -972,9 +995,10 @@ async function generate() {
     const wgsBox = wgsBounds(padBox);
 
     const needOsm = opts.buildings || opts.roads || opts.green || opts.trees;
-    const needParcels = opts.parcels || opts.parcelNr;
-    const needRoofs = opts.buildings && ui.optRoof.checked;
-    const needTerrain = opts.green && ui.optTerrain.checked;
+    const swiss = inSwitzerland(bbox);
+    const needParcels = swiss && (opts.parcels || opts.parcelNr);
+    const needRoofs = swiss && opts.buildings && ui.optRoof.checked;
+    const needTerrain = swiss && opts.green && ui.optTerrain.checked;
     setStatus('');
 
     // Ladefortschritt. Overpass meldet keine Gesamtgrösse, daher dort eine Schätzung
@@ -1011,6 +1035,7 @@ async function generate() {
     ticker = setInterval(tick, 200);
 
     const warnings = [];
+    if (!swiss) warnings.push('Ausserhalb der Schweiz: Parzellen, echte Dachformen und Geländeschattierung sind hier noch nicht verfügbar.');
     const [osm, parcelsRaw, roofsRaw, terrain] = await Promise.all([
       needOsm
         ? fetchOverpass(wgsBox, {
@@ -1384,6 +1409,10 @@ function treeGeom(style, r, seed) {
     trunk: v === 'plan' ? clamp(r * 0.07, 0.15, 0.45) : 0,
     cross: fam === 'circle' && v === '' ? r * 0.12 : 0
   };
+  if (v === 'wavy') {
+    g.outline = wavyOutline(r, rnd);
+    g.inner = [lobedOutline(r * 0.6, rnd, 0.8)];
+  }
   if (v === 'x') {
     if (fam !== 'circle') g.outline = lobedOutline(r, rnd);
     if (fam === 'flat') g.inner = [lobedOutline(r * 0.62, rnd, 0.8)];
@@ -1392,15 +1421,68 @@ function treeGeom(style, r, seed) {
   return g;
 }
 
+// Unregelmässige, wellige Kronenlinie (mehrere überlagerte Frequenzen)
+function wavyOutline(r, rnd, N = 240) {
+  const ph = [rnd() * 6.3, rnd() * 6.3, rnd() * 6.3, rnd() * 6.3, rnd() * 6.3];
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const a = i / N * Math.PI * 2;
+    const k = 0.9 + 0.045 * Math.sin(3 * a + ph[0]) + 0.03 * Math.sin(7 * a + ph[1]) +
+      0.02 * Math.sin(19 * a + ph[2]) + 0.012 * Math.sin(37 * a + ph[3]) + 0.008 * (rnd() - 0.5);
+    pts.push([Math.cos(a) * r * k, Math.sin(a) * r * k]);
+  }
+  pts.push(pts[0]);
+  return pts;
+}
+
+// Kreis komplex: Rand aus Bögen wie «Wellig», aber unterbrochen; innen Blätter als leichte Textur
+function leafLoopGeom(g, r, rnd, s, P, shadeAt) {
+  let a = rnd() * Math.PI * 2;
+  const end = a + Math.PI * 2;
+  let seg = [];
+  while (a < end - 0.05) {
+    const w = Math.min(end - a, 0.22 + rnd() * 0.22);
+    const rr = r * (0.88 + rnd() * 0.06);
+    const bulge = rr * w * (0.28 + rnd() * 0.12);
+    // Lücken häufiger auf der Lichtseite
+    const skip = rnd() < 0.08 + 0.32 * (1 - shadeAt(a + w / 2));
+    if (skip) {
+      if (seg.length > 1) g.lines.push(seg);
+      seg = [];
+    } else {
+      for (let j = seg.length ? 1 : 0; j <= 6; j++) {
+        const u = j / 6, ang = a + w * u;
+        seg.push(P(ang, rr + bulge * Math.sin(Math.PI * u)));
+      }
+    }
+    a += w;
+  }
+  if (seg.length > 1) g.lines.push(seg);
+  // Blätter: kleine offene Bögen, zur Schattenseite und zum Rand hin dichter
+  for (let i = 0; i < 220; i++) {
+    const ang = rnd() * Math.PI * 2, d = r * 0.82 * Math.sqrt(rnd());
+    if (rnd() > 0.06 + 0.55 * shadeAt(ang) * (0.4 + 0.6 * d / r)) continue;
+    const c = P(ang, d), L = r * (0.035 + rnd() * 0.025), o = rnd() * Math.PI * 2;
+    const leaf = [];
+    for (let k = 0; k <= 5; k++) {
+      const t = -Math.PI * 0.55 + Math.PI * 1.1 * k / 5;
+      const lx = Math.cos(t) * L, ly = Math.sin(t) * L * 0.6;
+      leaf.push([c[0] + lx * Math.cos(o) - ly * Math.sin(o), c[1] + lx * Math.sin(o) + ly * Math.cos(o)]);
+    }
+    g.leaves = g.leaves || [];
+    g.leaves.push(leaf);
+  }
+}
+
 /* ---------- Weitere Symbole: handgezeichnet, gemalt, eigenes Bild ---------- */
 
 const EXTRA_TREES = [
-  { id: 'hand_sickle', label: 'Sichel' },
   { id: 'hand_loops', label: 'Schlaufen' },
   { id: 'hand_wavy', label: 'Wellig' },
   { id: 'hand_plates', label: 'Platten' },
   { id: 'hand_leaves', label: 'Blätter' },
   { id: 'paint', label: 'Gemalt' },
+  { id: 'flat_wavy', label: 'Flach wellig' },
   { id: 'custom', label: 'Eigenes' }
 ];
 const customTree = { img: null, multiply: true, rotate: true };
@@ -1415,16 +1497,8 @@ function handGeom(style, r, seed, sun) {
   const shadeAt = a => Math.max(0, Math.cos(a - s));
   const g = { r, circle: 0, outline: null, lines: [], rings: [], fills: [], cross: 0, heavy: false };
 
-  if (style === 'hand_sickle') {
-    g.circle = r; g.heavy = true; g.cross = r * 0.08;
-    const N = 40, pts = [];
-    for (let i = 0; i <= N; i++) pts.push(P(s - Math.PI / 2 + Math.PI * i / N, r));
-    for (let i = N; i >= 0; i--) {
-      const a = s - Math.PI / 2 + Math.PI * i / N;
-      pts.push(P(a, r - r * 0.17 * Math.pow(Math.max(0, Math.cos(a - s)), 1.3)));
-    }
-    pts.push(pts[0]);
-    g.fills.push(pts);
+  if (style === 'hand_leafloop') {
+    leafLoopGeom(g, r, rnd, s, P, shadeAt);
   } else if (style === 'hand_loops') {
     const loop = (c, ang, rho) => {
       const pts = [];
@@ -1547,6 +1621,12 @@ function drawHandTree(c, g, x, y, pxPerM, mm) {
   for (const l of g.lines) { path(l, false); c.stroke(); }
   c.lineWidth = mm(0.08);
   for (const ring of g.rings) { path(ring, true); c.stroke(); }
+  if (g.leaves) {
+    c.lineWidth = mm(0.06);
+    c.strokeStyle = 'rgba(27,27,26,0.75)';
+    for (const l of g.leaves) { path(l, false); c.stroke(); }
+    c.strokeStyle = '#1b1b1a';
+  }
   if (g.cross) {
     const k = g.cross * pxPerM;
     c.lineWidth = mm(0.12);
@@ -1555,16 +1635,27 @@ function drawHandTree(c, g, x, y, pxPerM, mm) {
   c.restore();
 }
 
-// Gemalte Krone: übereinanderliegende, ausgefranste Büschel in Olivtönen, Lichtseite heller,
-// dazu Lücken wie bei einem trockenen Pinsel
+// Gemalt: ruhige Kronenform wie «Flach komplex», gefüllt mit wenigen grossen,
+// ausgefransten Farbflächen; Lichtseite heller, Schattenseite dunkler.
 function paintPainterly(c, cx, cy, R, rnd, lx, ly) {
-  const pal = [[68, 92, 48], [96, 122, 64], [130, 154, 86], [170, 190, 122], [206, 220, 160]];
+  const pal = [[84, 110, 62], [118, 144, 84], [154, 178, 112], [192, 210, 150]];
+  const outline = lobedOutline(R, rnd);
+  const crown = () => {
+    c.beginPath();
+    outline.forEach(([x, y], i) => i ? c.lineTo(cx + x, cy - y) : c.moveTo(cx + x, cy - y));
+    c.closePath();
+  };
+  crown();
+  c.fillStyle = rgba(pal[1], 1);
+  c.fill();
+  c.save();
+  crown(); c.clip();
   const clump = (px, py, rad, col, alpha) => {
-    const n = 56;
+    const n = 34;
     c.beginPath();
     for (let i = 0; i <= n; i++) {
       const a = i / n * Math.PI * 2;
-      const k = rad * (0.7 + 0.32 * rnd());
+      const k = rad * (0.82 + 0.18 * rnd()) * (1 + 0.1 * Math.sin(4 * a + rad));
       const x = px + Math.cos(a) * k, y = py + Math.sin(a) * k;
       i ? c.lineTo(x, y) : c.moveTo(x, y);
     }
@@ -1572,33 +1663,29 @@ function paintPainterly(c, cx, cy, R, rnd, lx, ly) {
     c.fillStyle = rgba(col, alpha);
     c.fill();
   };
-  const place = (maxD, bias) => {
-    const a = rnd() * Math.PI * 2, d = maxD * Math.sqrt(rnd());
+  const at = (bias, spread) => {
+    const a = rnd() * Math.PI * 2, d = spread * Math.sqrt(rnd());
     return [cx + Math.cos(a) * d + lx * R * bias, cy + Math.sin(a) * d + ly * R * bias];
   };
-  for (let k = 0; k < 11; k++) { const [px, py] = place(R * 0.55, -0.12); clump(px, py, R * (0.3 + rnd() * 0.15), pal[rnd() < 0.6 ? 0 : 1], 0.92); }
-  for (let k = 0; k < 15; k++) { const [px, py] = place(R * 0.62, 0.06); clump(px, py, R * (0.18 + rnd() * 0.14), pal[rnd() < 0.5 ? 1 : 2], 0.85); }
-  for (let k = 0; k < 13; k++) { const [px, py] = place(R * 0.5, 0.2); clump(px, py, R * (0.1 + rnd() * 0.12), pal[3], 0.85); }
-  for (let k = 0; k < 12; k++) { const [px, py] = place(R * 0.45, 0.28); clump(px, py, R * (0.04 + rnd() * 0.06), pal[4], 0.9); }
-  // dunkle Tiefen zwischen den Büscheln
-  const m = Math.min(500, Math.round(R * R * 0.15));
-  for (let i = 0; i < m; i++) {
-    const [px, py] = place(R * 0.8, -0.05);
-    c.fillStyle = rgba(pal[0], 0.55);
-    const sz = Math.max(0.8, R * (0.012 + rnd() * 0.02));
-    c.fillRect(px, py, sz, sz * (0.6 + rnd()));
-  }
-  // Trockenpinsel-Lücken, zum Rand hin häufiger
+  for (let k = 0; k < 4; k++) { const [x, y] = at(-0.35, R * 0.4); clump(x, y, R * (0.4 + rnd() * 0.15), pal[0], 0.7); }
+  for (let k = 0; k < 4; k++) { const [x, y] = at(0.05, R * 0.45); clump(x, y, R * (0.3 + rnd() * 0.12), pal[2], 0.55); }
+  for (let k = 0; k < 3; k++) { const [x, y] = at(0.32, R * 0.3); clump(x, y, R * (0.18 + rnd() * 0.1), pal[3], 0.6); }
+  // wenige, grössere Pinsel-Lücken am Rand
   c.globalCompositeOperation = 'destination-out';
-  const holes = Math.min(1200, Math.round(R * R * 0.4));
-  for (let i = 0; i < holes; i++) {
-    const a = rnd() * Math.PI * 2, d = R * 1.02 * Math.sqrt(rnd());
-    if (rnd() > 0.08 + 0.9 * (d / R) ** 3) continue;
-    const sz = Math.max(0.8, R * (0.01 + rnd() * 0.025));
-    c.fillStyle = `rgba(0,0,0,${0.5 + rnd() * 0.5})`;
-    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz * (0.6 + rnd() * 0.8));
+  for (let i = 0; i < 40; i++) {
+    const a = rnd() * Math.PI * 2, d = R * (0.8 + rnd() * 0.25);
+    const sz = Math.max(1, R * (0.025 + rnd() * 0.04));
+    c.fillStyle = `rgba(0,0,0,${0.4 + rnd() * 0.5})`;
+    c.beginPath(); c.ellipse(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz * 0.6, a, 0, Math.PI * 2); c.fill();
   }
   c.globalCompositeOperation = 'source-over';
+  c.restore();
+  crown();
+  c.lineWidth = Math.max(1, R * 0.025);
+  c.strokeStyle = 'rgba(70,94,54,0.8)';
+  c.stroke();
+  c.fillStyle = rgba(pal[0], 1);
+  c.beginPath(); c.arc(cx, cy, Math.max(1, R * 0.04), 0, Math.PI * 2); c.fill();
 }
 
 function paintedSprite(rpx, variant, sun) {
@@ -1639,7 +1726,10 @@ function drawCustomTree(c, x, y, R, seed, mm) {
 }
 
 // Verteiler für alle Baumstile
+const resolveTree = st => st === 'circle_x' ? 'hand_leafloop' : st;
+
 function drawTree(c, style, x, y, r, seed, pxPerM, mm, sun) {
+  style = resolveTree(style);
   if (style.startsWith('hand_')) return drawHandTree(c, handGeom(style, r, seed, sun), x, y, pxPerM, mm);
   if (style === 'custom') return drawCustomTree(c, x, y, r * pxPerM, seed, mm);
   if (style === 'paint') {
@@ -2463,7 +2553,7 @@ async function buildDXF(plan, o) {
     ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9], ['MARKIERUNG', 9, 'MARKIERUNG'], ['FUSSGAENGERSTREIFEN', 9],
     ['BAHN', 8], ['STRASSENNAMEN', 7],
     ['GRUEN', 3], ['WALD', 94], ['WASSER', 5], ['BAEUME', 94],
-    ['BAEUME_KRONE_GESTRICHELT', 94, 'DASHED'], ['BAEUME_AESTE', 94], ['BAEUME_STAMM', 7], ['BAEUME_FUELLUNG', 7],
+    ['BAEUME_KRONE_GESTRICHELT', 94, 'DASHED'], ['BAEUME_AESTE', 94], ['BAEUME_STAMM', 7], ['BAEUME_FUELLUNG', 7], ['BAEUME_BLAETTER', 94],
     ['PARZELLEN', 7], ['PARZELLEN_NR', 7]
   ];
   const dash = 1.2 * plan.scale / 1000, gap = 0.8 * plan.scale / 1000;
@@ -2619,12 +2709,14 @@ async function buildDXF(plan, o) {
     if (t.e < minE || t.e > maxE || t.n < minN || t.n > maxN) continue;
     const r = treeDiameter(t, o) / 2;
     const at = pts => pts.map(([x, y]) => [t.e + x, t.n + y]);
-    if (treeStyle.startsWith('hand_')) {
-      const hg = handGeom(treeStyle, r, t.seed, sun);
+    const ts = resolveTree(treeStyle);
+    if (ts.startsWith('hand_')) {
+      const hg = handGeom(ts, r, t.seed, sun);
       if (hg.circle) { g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(hg.circle)); }
       if (hg.outline) pline('BAEUME', at(hg.outline));
       for (const l of hg.lines) plineOpen('BAEUME', at(l));
       for (const ring of hg.rings) pline('BAEUME', at(ring));
+      for (const l of hg.leaves || []) plineOpen('BAEUME_BLAETTER', at(l));
       for (const fl of hg.fills) { pline('BAEUME_FUELLUNG', at(fl)); solids('BAEUME_FUELLUNG', [at(fl)]); }
       if (hg.cross) {
         line('BAEUME', [t.e - hg.cross, t.n], [t.e + hg.cross, t.n]);
@@ -2900,8 +2992,6 @@ ui.btnBldg3d.addEventListener('click', () => search3d('bldg'));
    Freiwilliger Beitrag: Fenster nach dem Download, höchstens einmal pro Sitzung
    ========================================================= */
 const donateDlg = $('donate');
-const donateConfigured = DONATE.paypalMe && DONATE.paypalMe !== 'DEIN-PAYPAL-NAME';
-
 (function buildDonate() {
   const box = $('donateAmounts');
   for (const amt of DONATE.amounts) {
@@ -2909,20 +2999,8 @@ const donateConfigured = DONATE.paypalMe && DONATE.paypalMe !== 'DEIN-PAYPAL-NAM
     a.textContent = `${amt} ${DONATE.currency === 'EUR' ? '€' : DONATE.currency}`;
     a.target = '_blank';
     a.rel = 'noopener';
-    a.href = donateConfigured
-      ? `https://www.paypal.me/${encodeURIComponent(DONATE.paypalMe)}/${amt}${DONATE.currency}`
-      : '#';
-    a.addEventListener('click', ev => {
-      if (!donateConfigured) {
-        ev.preventDefault();
-        const note = $('donateNote');
-        note.hidden = false;
-        note.textContent = 'Der PayPal-Link ist noch nicht eingerichtet (DONATE.paypalMe in app.js).';
-        return;
-      }
-      try { sessionStorage.setItem('lageplan.donated', '1'); } catch (e) { /* egal */ }
-      setTimeout(() => donateDlg.close(), 300);
-    });
+    a.href = `${DONATE.url}&amount=${amt}&currency_code=${DONATE.currency}`;
+    a.addEventListener('click', () => setTimeout(() => donateDlg.close(), 300));
     box.appendChild(a);
   }
 })();
@@ -2932,21 +3010,15 @@ function showDonate() {
   else donateDlg.setAttribute('open', '');
 }
 
+// Nach einem Download höchstens einmal pro Besuch fragen
 function askForSupport() {
   try {
-    if (localStorage.getItem('lageplan.noDonate') === '1') return;
     if (sessionStorage.getItem('lageplan.asked') === '1') return;
     sessionStorage.setItem('lageplan.asked', '1');
   } catch (e) { /* ohne Speicher trotzdem fragen */ }
-  setTimeout(showDonate, 600); // erst nach dem Start des Downloads
+  setTimeout(showDonate, 600);
 }
 
-$('donateNever').addEventListener('change', e => {
-  try {
-    if (e.target.checked) localStorage.setItem('lageplan.noDonate', '1');
-    else localStorage.removeItem('lageplan.noDonate');
-  } catch (err) { /* egal */ }
-});
 $('btnSupport').addEventListener('click', showDonate);
 
 buildTreePicker();
