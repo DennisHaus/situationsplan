@@ -1458,10 +1458,20 @@ function leafLoopGeom(g, r, rnd, s, P, shadeAt) {
     a += w;
   }
   if (seg.length > 1) g.lines.push(seg);
-  // Blätter: kleine offene Bögen, zur Schattenseite und zum Rand hin dichter
-  for (let i = 0; i < 220; i++) {
-    const ang = rnd() * Math.PI * 2, d = r * 0.82 * Math.sqrt(rnd());
-    if (rnd() > 0.06 + 0.55 * shadeAt(ang) * (0.4 + 0.6 * d / r)) continue;
+  // innere Schlaufenreihe auf der Schattenseite
+  for (let a2 = s - 1.2; a2 < s + 1.2; ) {
+    const w = 0.28 + rnd() * 0.2, rr = r * (0.58 + rnd() * 0.08), bulge = rr * w * 0.3;
+    if (rnd() < 0.75) {
+      const arc = [];
+      for (let j = 0; j <= 5; j++) { const u = j / 5; arc.push(P(a2 + w * u, rr + bulge * Math.sin(Math.PI * u))); }
+      g.lines.push(arc);
+    }
+    a2 += w + 0.05 + rnd() * 0.12;
+  }
+  // Blätter als füllende Textur: überall, zur Schattenseite hin dichter
+  for (let i = 0; i < 380; i++) {
+    const ang = rnd() * Math.PI * 2, d = r * 0.84 * Math.sqrt(rnd());
+    if (rnd() > 0.28 + 0.5 * shadeAt(ang) * (0.5 + 0.5 * d / r)) continue;
     const c = P(ang, d), L = r * (0.035 + rnd() * 0.025), o = rnd() * Math.PI * 2;
     const leaf = [];
     for (let k = 0; k <= 5; k++) {
@@ -1479,7 +1489,6 @@ function leafLoopGeom(g, r, rnd, s, P, shadeAt) {
 const EXTRA_TREES = [
   { id: 'hand_loops', label: 'Schlaufen' },
   { id: 'hand_wavy', label: 'Wellig' },
-  { id: 'hand_plates', label: 'Platten' },
   { id: 'hand_leaves', label: 'Blätter' },
   { id: 'paint', label: 'Gemalt' },
   { id: 'flat_wavy', label: 'Flach wellig' },
@@ -1554,30 +1563,6 @@ function handGeom(style, r, seed, sun) {
       g.rings.push(ring);
     }
     g.cross = r * 0.07;
-  } else if (style === 'hand_plates') {
-    g.outline = lobedOutline(r, rnd, 0.5);
-    const nm = 5 + Math.floor(rnd() * 3), ph = rnd() * Math.PI * 2, mains = [];
-    for (let k = 0; k < nm; k++) {
-      let ang = ph + k * Math.PI * 2 / nm + (rnd() - 0.5) * 0.5;
-      let p = [0, 0];
-      const pts = [p];
-      for (let st = 0; st < 6; st++) {
-        ang += (rnd() - 0.5) * 0.7;
-        p = [p[0] + Math.cos(ang) * r * 0.16, p[1] + Math.sin(ang) * r * 0.16];
-        const d = Math.hypot(p[0], p[1]);
-        if (d > r * 0.86) { p = [p[0] / d * r * 0.9, p[1] / d * r * 0.9]; pts.push(p); break; }
-        pts.push(p);
-      }
-      mains.push(pts);
-      g.lines.push(pts);
-    }
-    for (let k = 0; k < nm; k++) {
-      const A = mains[k], B = mains[(k + 1) % nm];
-      if (rnd() > 0.75 || A.length < 3 || B.length < 3) continue;
-      const pa = A[Math.min(A.length - 1, 2 + Math.floor(rnd() * 3))], pb = B[Math.min(B.length - 1, 2 + Math.floor(rnd() * 3))];
-      const q = [(pa[0] + pb[0]) / 2 + (rnd() - 0.5) * r * 0.12, (pa[1] + pb[1]) / 2 + (rnd() - 0.5) * r * 0.12];
-      g.lines.push([pa, q, pb]);
-    }
   } else if (style === 'hand_leaves') {
     for (let i = 0; i < 260; i++) {
       const a = rnd() * Math.PI * 2, d = r * 0.94 * Math.sqrt(rnd());
@@ -1638,7 +1623,7 @@ function drawHandTree(c, g, x, y, pxPerM, mm) {
 // Gemalt: ruhige Kronenform wie «Flach komplex», gefüllt mit wenigen grossen,
 // ausgefransten Farbflächen; Lichtseite heller, Schattenseite dunkler.
 function paintPainterly(c, cx, cy, R, rnd, lx, ly) {
-  const pal = [[84, 110, 62], [118, 144, 84], [154, 178, 112], [192, 210, 150]];
+  const pal = [[112, 138, 82], [126, 152, 92], [142, 166, 104], [158, 180, 118]];
   const outline = lobedOutline(R, rnd);
   const crown = () => {
     c.beginPath();
@@ -1667,13 +1652,13 @@ function paintPainterly(c, cx, cy, R, rnd, lx, ly) {
     const a = rnd() * Math.PI * 2, d = spread * Math.sqrt(rnd());
     return [cx + Math.cos(a) * d + lx * R * bias, cy + Math.sin(a) * d + ly * R * bias];
   };
-  for (let k = 0; k < 4; k++) { const [x, y] = at(-0.35, R * 0.4); clump(x, y, R * (0.4 + rnd() * 0.15), pal[0], 0.7); }
-  for (let k = 0; k < 4; k++) { const [x, y] = at(0.05, R * 0.45); clump(x, y, R * (0.3 + rnd() * 0.12), pal[2], 0.55); }
-  for (let k = 0; k < 3; k++) { const [x, y] = at(0.32, R * 0.3); clump(x, y, R * (0.18 + rnd() * 0.1), pal[3], 0.6); }
+  for (let k = 0; k < 2; k++) { const [x, y] = at(-0.32, R * 0.25); clump(x, y, R * (0.6 + rnd() * 0.12), pal[0], 0.6); }
+  for (let k = 0; k < 2; k++) { const [x, y] = at(0.08, R * 0.25); clump(x, y, R * (0.45 + rnd() * 0.1), pal[2], 0.55); }
+  { const [x, y] = at(0.3, R * 0.15); clump(x, y, R * (0.32 + rnd() * 0.08), pal[3], 0.6); }
   // wenige, grössere Pinsel-Lücken am Rand
   c.globalCompositeOperation = 'destination-out';
-  for (let i = 0; i < 40; i++) {
-    const a = rnd() * Math.PI * 2, d = R * (0.8 + rnd() * 0.25);
+  for (let i = 0; i < 18; i++) {
+    const a = rnd() * Math.PI * 2, d = R * (0.82 + rnd() * 0.22);
     const sz = Math.max(1, R * (0.025 + rnd() * 0.04));
     c.fillStyle = `rgba(0,0,0,${0.4 + rnd() * 0.5})`;
     c.beginPath(); c.ellipse(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz * 0.6, a, 0, Math.PI * 2); c.fill();
@@ -1903,13 +1888,15 @@ function stipple(c, plan, pxPerM, mm, kind) {
   c.stroke();
 }
 
-// Waldsignatur: dichtes Kronendach aus vielen kleinen Kronen mit Schlagschatten.
+// Waldsignatur im Stil «Flach wellig»: überlappende Kronen mit welliger Kante,
+// leicht unterschiedliche Grüntöne, Kontur nur auf der Schattenseite.
 // Lage an Weltkoordinaten gebunden, damit Vorschau und Export übereinstimmen.
 function forestCanopy(c, plan, pxPerM, mm, sun) {
   const [minE, minN, maxE, maxN] = plan.bbox;
-  let step = Math.max(4.5, 2.4 * plan.scale / 1000);
-  while (((maxE - minE) / step) * ((maxN - minN) / step) > 60000) step *= 1.2;
+  let step = Math.max(5.5, 2.8 * plan.scale / 1000);
+  while (((maxE - minE) / step) * ((maxN - minN) / step) > 40000) step *= 1.2;
   const X = e => (e - minE) * pxPerM, Y = n => (maxN - n) * pxPerM;
+  const s = Math.atan2(sun.shadow[1], sun.shadow[0]);
   const crowns = [];
   const i0 = Math.floor(minE / step) - 1, i1 = Math.ceil(maxE / step) + 1;
   const j0 = Math.floor(minN / step) - 1, j1 = Math.ceil(maxN / step) + 1;
@@ -1917,31 +1904,34 @@ function forestCanopy(c, plan, pxPerM, mm, sun) {
     crowns.push({
       e: (i + 0.1 + 0.8 * hash2(i, j, 31)) * step,
       n: (j + 0.1 + 0.8 * hash2(i, j, 32)) * step,
-      r: step * (0.5 + 0.28 * hash2(i, j, 33)),
-      t: hash2(i, j, 34)
+      r: step * (0.62 + 0.22 * hash2(i, j, 33)),
+      t: hash2(i, j, 34), p1: hash2(i, j, 35) * 6.3, p2: hash2(i, j, 36) * 6.3
     });
   }
   crowns.sort((a, b) => a.t - b.t);
-  const [sx, sy] = sun.shadow, [lx, ly] = sun.toSun;
-  // Schatten als eine Fläche, damit Überlappungen nicht doppelt dunkeln
-  c.fillStyle = 'rgba(36,56,32,0.24)';
-  c.beginPath();
+  const N = 36;
+  const pt = (k, a) => {
+    const rr = k.r * (0.93 + 0.04 * Math.sin(5 * a + k.p1) + 0.025 * Math.sin(13 * a + k.p2));
+    return [X(k.e + Math.cos(a) * rr), Y(k.n + Math.sin(a) * rr)];
+  };
+  c.lineWidth = Math.max(0.5, mm(0.09));
+  c.strokeStyle = 'rgba(74,102,62,0.6)';
   for (const k of crowns) {
-    const off = k.r * 0.45, cx = X(k.e + sx * off), cy = Y(k.n + sy * off), R = k.r * pxPerM;
-    c.moveTo(cx + R, cy); c.arc(cx, cy, R, 0, Math.PI * 2);
-  }
-  c.fill();
-  c.lineWidth = Math.max(0.5, mm(0.07));
-  c.strokeStyle = 'rgba(74,104,64,0.75)';
-  for (const k of crowns) {
-    const cx = X(k.e), cy = Y(k.n), R = k.r * pxPerM;
-    const col = mix([150, 176, 128], [184, 204, 156], k.t);
-    c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2);
+    const col = mix([170, 192, 152], [190, 207, 172], k.t);
+    c.beginPath();
+    for (let q = 0; q < N; q++) {
+      const [x, y] = pt(k, q / N * Math.PI * 2);
+      q ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.closePath();
     c.fillStyle = `rgb(${col[0]},${col[1]},${col[2]})`;
-    c.fill(); c.stroke();
-    c.beginPath(); c.arc(cx + lx * R * 0.28, cy - ly * R * 0.28, R * 0.5, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(250,252,236,0.2)';
     c.fill();
+    c.beginPath();
+    for (let q = 0; q <= 18; q++) {
+      const [x, y] = pt(k, s - 1.4 + 2.8 * q / 18);
+      q ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.stroke();
   }
 }
 
@@ -3010,12 +3000,8 @@ function showDonate() {
   else donateDlg.setAttribute('open', '');
 }
 
-// Nach einem Download höchstens einmal pro Besuch fragen
+// Nach jedem Export (PNG oder DXF) kurz nach dem Start des Downloads anzeigen
 function askForSupport() {
-  try {
-    if (sessionStorage.getItem('lageplan.asked') === '1') return;
-    sessionStorage.setItem('lageplan.asked', '1');
-  } catch (e) { /* ohne Speicher trotzdem fragen */ }
   setTimeout(showDonate, 600);
 }
 
