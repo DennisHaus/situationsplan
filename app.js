@@ -145,9 +145,49 @@ function applyStylePreset() {
   ui.optRoof.checked = detail;
   ui.optShadow.checked = detail;
   ui.optTexture.checked = detail;
+  setTreeStyle(detail ? 'leaf' : 'line');
+}
+
+function setTreeStyle(id) {
+  treeStyle = id;
+  const el = document.querySelector(`input[name="treeStyle"][value="${id}"]`);
+  if (el) el.checked = true;
+}
+
+// Auswahl mit kleinen Vorschaubildern
+function buildTreePicker() {
+  const wrap = $('treeStyles');
+  wrap.innerHTML = '';
+  const dpr = window.devicePixelRatio || 1;
+  const sun = sunVectors(ui.sun.value);
+  for (const st of TREE_STYLES) {
+    const lab = document.createElement('label');
+    lab.className = 'tree-opt';
+    const inp = document.createElement('input');
+    inp.type = 'radio'; inp.name = 'treeStyle'; inp.value = st.id;
+    inp.checked = st.id === treeStyle;
+    inp.addEventListener('change', () => { treeStyle = st.id; renderPreview(); });
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = Math.round(44 * dpr);
+    const c = cv.getContext('2d');
+    drawTree(c, st.id, cv.width / 2, cv.height / 2, 17 * dpr, 7, v => v * 3.2 * dpr, sun);
+    const name = document.createElement('span');
+    name.textContent = st.label;
+    const kind = document.createElement('span');
+    kind.className = 'kind';
+    kind.textContent = st.kind;
+    lab.append(inp, cv, name, kind);
+    wrap.appendChild(lab);
+  }
 }
 ui.style.addEventListener('change', () => { applyStylePreset(); renderPreview(); });
-[ui.optRoof, ui.optShadow, ui.optTexture, ui.sun].forEach(el => el.addEventListener('change', renderPreview));
+[ui.optRoof, ui.optShadow, ui.optTexture].forEach(el => el.addEventListener('change', renderPreview));
+ui.sun.addEventListener('change', () => { buildTreePicker(); renderPreview(); });
+ui.optRoof.addEventListener('change', () => {
+  if (ui.optRoof.checked && state.plan && !state.plan.roofsLoaded) {
+    setStatus('Für echte Dachformen den Plan neu erzeugen.');
+  }
+});
 
 /* ---------- Ortssuche (geo.admin.ch) ---------- */
 $('searchForm').addEventListener('submit', async ev => {
@@ -204,6 +244,9 @@ async function fetchOverpass([s, w, n, e], hooks = {}) {
   relation["type"="multipolygon"]["natural"~"${RE_NATURAL}"]${b};
   way["waterway"="riverbank"]${b};
   node["natural"="tree"]${b};
+  way["railway"~"^(rail|tram|light_rail|narrow_gauge)$"]${b};
+  node["highway"="crossing"]${b};
+  way["building:part"="arcade"]${b};
 );
 out geom;`;
 
@@ -282,6 +325,82 @@ async function fetchParcels(bbox, onPage) {
   return parcels;
 }
 
+// Dachflächen aus Sonnendach.ch (BFE): jede Dachfläche einzeln, mit Neigung und Ausrichtung.
+// Abfrage in Rasterzellen, damit pro Anfrage nicht zu viele Flächen zurückkommen.
+async function fetchRoofs(bbox, onProgress) {
+  const CELL = 120, LIMIT = 50;
+  const cells = [];
+  for (let e = bbox[0]; e < bbox[2]; e += CELL) {
+    for (let n = bbox[1]; n < bbox[3]; n += CELL) {
+      cells.push([e, n, Math.min(e + CELL, bbox[2]), Math.min(n + CELL, bbox[3])]);
+    }
+  }
+  const seen = new Map();
+  let done = 0, failed = 0;
+  const one = async cell => {
+    const [a, b, c, d] = cell.map(v => v.toFixed(1));
+    for (let page = 0; page < 40; page++) {
+      const url = 'https://api3.geo.admin.ch/rest/services/all/MapServer/identify' +
+        `?geometry=${a},${b},${c},${d}&geometryType=esriGeometryEnvelope` +
+        '&layers=all:ch.bfe.solarenergie-eignung-daecher' +
+        `&mapExtent=${a},${b},${c},${d}&imageDisplay=1000,1000,96&tolerance=0` +
+        '&sr=2056&returnGeometry=true&geometryFormat=geojson' +
+        `&limit=${LIMIT}&offset=${page * LIMIT}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      const results = j.results || [];
+      let added = 0;
+      for (const f of results) {
+        const id = f.featureId != null ? f.featureId : f.id;
+        if (!seen.has(id)) { seen.set(id, f); added++; }
+      }
+      if (results.length < LIMIT || added === 0) break;
+    }
+  };
+  const queue = [...cells];
+  const worker = async () => {
+    while (queue.length) {
+      const cell = queue.shift();
+      try { await one(cell); } catch (e) { failed++; }
+      done++;
+      if (onProgress) onProgress(done / cells.length, seen.size);
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (failed === cells.length) throw new Error('Dachdaten nicht erreichbar');
+  return [...seen.values()];
+}
+
+// Sonnendach: Ausrichtung 0° = Süd, -90° = Ost, 90° = West, ±180° = Nord.
+// Daraus die Fallrichtung der Dachfläche als Vektor (Ost, Nord).
+function roofFaceFrom(f) {
+  const p = f.properties || f.attributes || {};
+  const tilt = parseFloat(p.neigung);
+  const az = parseFloat(p.ausrichtung);
+  const pitched = isFinite(tilt) && tilt > 5 && isFinite(az);
+  const rad = az * Math.PI / 180;
+  const polys = [];
+  collectPolys(f.geometry, polys);
+  const bid = p.building_id != null ? 'b' + p.building_id : 'f' + (f.featureId != null ? f.featureId : f.id);
+  return polys.map(poly => {
+    const ring = poly[0];
+    let cx = 0, cy = 0;
+    for (const q of ring) { cx += q[0]; cy += q[1]; }
+    return {
+      poly: poly.map(r => r.map(q => [q[0], q[1]])),
+      tilt: isFinite(tilt) ? tilt : null,
+      dir: pitched ? [-Math.sin(rad), -Math.cos(rad)] : null,
+      bid, c: [cx / ring.length, cy / ring.length]
+    };
+  });
+}
+
+function isZebra(t) {
+  return t.crossing === 'zebra' || t.crossing_ref === 'zebra' || t.crossing === 'marked' ||
+    t.crossing === 'uncontrolled' || (t['crossing:markings'] && t['crossing:markings'] !== 'no');
+}
+
 /* =========================================================
    OSM-Daten aufbereiten
    ========================================================= */
@@ -337,7 +456,7 @@ function elementToPolygons(el) {
 }
 
 const isUnderground = t =>
-  (t.tunnel && t.tunnel !== 'no') || (t.layer && parseFloat(t.layer) < 0) ||
+  (t.tunnel && t.tunnel !== 'no' && t.tunnel !== 'building_passage') || (t.layer && parseFloat(t.layer) < 0) ||
   t.location === 'underground' || t.indoor === 'yes' ||
   t.parking === 'underground' || t.parking === 'multi-storey';
 
@@ -371,17 +490,30 @@ function roadSpec(t) {
   }
   const sw = kind === 'foot' ? 0 : sidewalkSides(t) * SIDEWALK_WIDTH;
   const rank = { foot: 0, service: 1, minor: 2, major: 3 }[kind];
-  return { kind, rank, outerW: w + sw, innerW: sw ? w : 0 };
+  return {
+    kind, rank, outerW: w + sw, innerW: sw ? w : 0, hw,
+    name: t.name || '',
+    oneway: t.oneway === 'yes' || t.oneway === '1' || t.junction === 'roundabout',
+    passage: t.covered === 'arcade' || t.tunnel === 'building_passage' || (kind === 'foot' && t.covered === 'yes')
+  };
 }
 
 function classify(osm) {
-  const out = { buildings: [], roadLines: [], roadAreas: [], green: [], trees: [] };
+  const out = { buildings: [], roadLines: [], roadAreas: [], green: [], trees: [], rails: [], crossings: [], arcades: [] };
   for (const el of osm.elements || []) {
     const t = el.tags || {};
     if (el.type === 'node') {
       if (t.natural === 'tree') out.trees.push({ lon: el.lon, lat: el.lat, tags: t });
+      else if (t.highway === 'crossing') out.crossings.push({ id: el.id, tags: t });
       continue;
     }
+    if (t.railway && el.type === 'way') {
+      if (!isUnderground(t) && /^(rail|tram|light_rail|narrow_gauge)$/.test(t.railway)) {
+        out.rails.push({ coords: wayCoords(el), kind: t.railway });
+      }
+      continue;
+    }
+    if (t['building:part'] === 'arcade') { out.arcades.push(...elementToPolygons(el)); continue; }
     if (t.building && t.building !== 'no') {
       if (!isUnderground(t)) elementToPolygons(el).forEach(poly => out.buildings.push({ poly, tags: t }));
       continue;
@@ -393,7 +525,7 @@ function classify(osm) {
     if (t.highway && el.type === 'way') {
       if (SKIP_HIGHWAY.has(t.highway) || isUnderground(t)) continue;
       const c = wayCoords(el);
-      if (c.length >= 2) out.roadLines.push({ coords: c, tags: t });
+      if (c.length >= 2) out.roadLines.push({ coords: c, tags: t, nodes: el.nodes || [] });
       continue;
     }
     const kind = greenKind(t);
@@ -463,6 +595,77 @@ function ringArea(ring) {
   return a / 2; // Vorzeichen abhängig von der Umlaufrichtung
 }
 const planarArea = poly => Math.abs(ringArea(poly[0]));
+
+// Polylinie seitlich um d versetzen (für Gleise und Laubenränder)
+function offsetPolyline(pts, d) {
+  const n = pts.length;
+  if (n < 2) return pts;
+  const nrm = [];
+  for (let i = 0; i < n - 1; i++) {
+    const dx = pts[i + 1][0] - pts[i][0], dy = pts[i + 1][1] - pts[i][1];
+    const len = Math.hypot(dx, dy) || 1;
+    nrm.push([-dy / len, dx / len]);
+  }
+  return pts.map((p, i) => {
+    const a = nrm[Math.max(0, i - 1)], b = nrm[Math.min(n - 2, i)];
+    let mx = a[0] + b[0], my = a[1] + b[1];
+    const ml = Math.hypot(mx, my) || 1;
+    mx /= ml; my /= ml;
+    const k = d / Math.max(0.3, mx * b[0] + my * b[1]);
+    return [p[0] + mx * k, p[1] + my * k];
+  });
+}
+
+function clipLine(pts, bbox) {
+  try {
+    const g = turf.bboxClip(turf.lineString(pts), bbox).geometry;
+    if (g.type === 'LineString') return g.coordinates.length >= 2 ? [g.coordinates] : [];
+    return g.coordinates.filter(c => c.length >= 2);
+  } catch (e) { return []; }
+}
+
+// Positionen für Strassennamen: lange, fast gerade Abschnitte, ein Name pro ca. 7 cm Papier
+function streetLabels(plan) {
+  const h = 2.1 * plan.scale / 1000;
+  const [minE, minN, maxE, maxN] = plan.bbox;
+  const m = h * 2;
+  const cands = [];
+  for (const l of plan.roadLines) {
+    if (!l.name || (l.kind === 'foot' && l.hw !== 'pedestrian')) continue;
+    const need = l.name.length * 0.56 * h * 1.25;
+    const pts = l.lv;
+    let s = 0;
+    while (s < pts.length - 1) {
+      const a0 = Math.atan2(pts[s + 1][1] - pts[s][1], pts[s + 1][0] - pts[s][0]);
+      let e = s + 1;
+      while (e < pts.length - 1) {
+        const a1 = Math.atan2(pts[e + 1][1] - pts[e][1], pts[e + 1][0] - pts[e][0]);
+        let d = Math.abs(a1 - a0);
+        if (d > Math.PI) d = 2 * Math.PI - d;
+        if (d > 0.18) break;
+        e++;
+      }
+      const A = pts[s], B = pts[e];
+      const len = Math.hypot(B[0] - A[0], B[1] - A[1]);
+      const mid = [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2];
+      if (len >= need && mid[0] > minE + m && mid[0] < maxE - m && mid[1] > minN + m && mid[1] < maxN - m) {
+        let ang = Math.atan2(B[1] - A[1], B[0] - A[0]);
+        if (ang > Math.PI / 2) ang -= Math.PI;
+        if (ang <= -Math.PI / 2) ang += Math.PI;
+        cands.push({ name: l.name, e: mid[0], n: mid[1], ang, len, need });
+      }
+      s = e;
+    }
+  }
+  cands.sort((a, b) => b.len - a.len);
+  const out = [];
+  for (const c of cands) {
+    if (out.some(o => o.name === c.name && Math.hypot(o.e - c.e, o.n - c.n) < 0.07 * plan.scale)) continue;
+    if (out.some(o => Math.hypot(o.e - c.e, o.n - c.n) < (o.need + c.need) / 2)) continue;
+    out.push(c);
+  }
+  return out;
+}
 
 function labelPoint(poly) {
   try { return turf.pointOnFeature(turf.polygon(poly)).geometry.coordinates; }
@@ -659,39 +862,47 @@ async function generate() {
   try {
     const pad = 60;
     const padBox = [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad];
+    const roofBox = [bbox[0] - 25, bbox[1] - 25, bbox[2] + 25, bbox[3] + 25];
     const wgsBox = wgsBounds(padBox);
 
     const needOsm = opts.buildings || opts.roads || opts.green || opts.trees;
     const needParcels = opts.parcels || opts.parcelNr;
+    const needRoofs = opts.buildings && ui.optRoof.checked;
     setStatus('');
 
-    // Ladefortschritt: Overpass sendet keine Gesamtgrösse, daher Schätzung
-    // aus Wartezeit und empfangener Datenmenge
-    const load = { phase: 'wait', t0: performance.now(), received: 0, total: 0, pages: 0, osmDone: !needOsm, parcDone: !needParcels };
+    // Ladefortschritt. Overpass meldet keine Gesamtgrösse, daher dort eine Schätzung
+    // aus Wartezeit und empfangener Datenmenge; Parzellen und Dächer zählen echt.
+    const load = {
+      phase: 'wait', t0: performance.now(), received: 0, total: 0,
+      pages: 0, roofFrac: 0, roofCount: 0,
+      osmDone: !needOsm, parcDone: !needParcels, roofDone: !needRoofs
+    };
     const areaHa = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / 1e4;
     const expectedBytes = Math.max(4e5, areaHa * 2.5e5);
     const tick = () => {
       let o = 1;
       if (!load.osmDone) {
-        if (load.phase === 'wait') {
-          o = 0.4 * (1 - Math.exp(-(performance.now() - load.t0) / 12000));
-        } else {
-          o = 0.4 + 0.6 * (load.total ? load.received / load.total : 1 - Math.exp(-load.received / expectedBytes));
-          o = Math.min(o, 0.98);
-        }
+        if (load.phase === 'wait') o = 0.4 * (1 - Math.exp(-(performance.now() - load.t0) / 12000));
+        else o = Math.min(0.98, 0.4 + 0.6 * (load.total ? load.received / load.total : 1 - Math.exp(-load.received / expectedBytes)));
       }
       const p = load.parcDone ? 1 : Math.min(0.9, 0.15 + load.pages * 0.3);
-      const f = needOsm && needParcels ? 0.8 * o + 0.2 * p : needOsm ? o : p;
-      const detail = !needOsm ? 'Parzellen werden geladen …'
-        : load.osmDone ? 'OpenStreetMap geladen, warte auf Parzellen …'
-        : load.phase === 'wait' ? 'OpenStreetMap stellt die Daten zusammen …'
-        : `${(load.received / 1e6).toFixed(1)} MB von OpenStreetMap empfangen`;
-      progress.set(2 + 58 * f, 'Lade Daten', detail);
+      const r = load.roofDone ? 1 : load.roofFrac;
+      const parts = [];
+      if (needOsm) parts.push([0.55, o]);
+      if (needParcels) parts.push([0.15, p]);
+      if (needRoofs) parts.push([0.3, r]);
+      const wsum = parts.reduce((t, x) => t + x[0], 0) || 1;
+      const f = parts.reduce((t, x) => t + x[0] * x[1], 0) / wsum;
+      const bits = [];
+      if (needOsm && !load.osmDone) bits.push(load.phase === 'wait' ? 'OpenStreetMap stellt Daten zusammen' : `${(load.received / 1e6).toFixed(1)} MB von OpenStreetMap`);
+      if (needRoofs && !load.roofDone) bits.push(`${load.roofCount} Dachflächen`);
+      if (needParcels && !load.parcDone) bits.push('Parzellen');
+      progress.set(2 + 58 * f, 'Lade Daten', bits.length ? bits.join(', ') + ' …' : 'Fast fertig …');
     };
     ticker = setInterval(tick, 200);
 
     const warnings = [];
-    const [osm, parcelsRaw] = await Promise.all([
+    const [osm, parcelsRaw, roofsRaw] = await Promise.all([
       needOsm
         ? fetchOverpass(wgsBox, {
             onHeaders: total => { load.phase = 'bytes'; load.total = total; },
@@ -701,8 +912,13 @@ async function generate() {
         : Promise.resolve({ elements: [] }),
       needParcels
         ? fetchParcels(bbox, n => { load.pages = n; })
-            .catch(err => { warnings.push('Parzellen nicht verfügbar (' + err.message + ')'); return []; })
+            .catch(err => { warnings.push('Parzellen nicht verfügbar (' + err.message + ').'); return []; })
             .then(r => { load.parcDone = true; return r; })
+        : Promise.resolve([]),
+      needRoofs
+        ? fetchRoofs(roofBox, (frac, count) => { load.roofFrac = frac; load.roofCount = count; })
+            .catch(err => { warnings.push('Echte Dachformen nicht verfügbar, Dächer schematisch (' + err.message + ').'); return []; })
+            .then(r => { load.roofDone = true; return r; })
         : Promise.resolve([])
     ]);
     clearInterval(ticker); ticker = null;
@@ -713,14 +929,15 @@ async function generate() {
     const data = classify(osm);
     const plan = {
       bbox, scale, buildings: [], green: [], roadAreas: [], roadLines: [],
-      trees: [], parcels: [], labels: []
+      trees: [], parcels: [], labels: [], rails: [], zebras: [], passages: [], arcades: [],
+      roofFaces: [], roofOutlines: [], roofsLoaded: needRoofs
     };
 
     if (opts.buildings) {
       const n = data.buildings.length;
       for (let i = 0; i < n; i++) {
         if (i % 40 === 0) {
-          progress.set(62 + 18 * i / n, 'Verarbeite Gebäude', `${i} von ${n}`);
+          progress.set(62 + 10 * i / n, 'Verarbeite Gebäude', `${i} von ${n}`);
           await yieldUI();
         }
         const b = data.buildings[i];
@@ -728,12 +945,49 @@ async function generate() {
         if (!bboxHit(polyBBox(poly), padBox)) continue;
         const area = planarArea(poly);
         plan.buildings.push({
-          poly, height: buildingHeight(b.tags, area), roof: computeRoof(poly, b.tags, area)
+          poly, height: buildingHeight(b.tags, area), roof: computeRoof(poly, b.tags, area), hasRoof: false
         });
+      }
+      plan.arcades = data.arcades.map(projPoly).filter(p => bboxHit(polyBBox(p), padBox));
+    }
+
+    // Echte Dachflächen: pro Gebäude vereinigen (Dachumriss) und den OSM-Gebäuden zuordnen
+    if (roofsRaw.length) {
+      for (const f of roofsRaw) plan.roofFaces.push(...roofFaceFrom(f));
+      const groups = new Map();
+      for (const f of plan.roofFaces) {
+        if (!groups.has(f.bid)) groups.set(f.bid, []);
+        groups.get(f.bid).push(f.poly);
+      }
+      let k = 0;
+      for (const polys of groups.values()) {
+        if (k++ % 30 === 0) {
+          progress.set(72 + 10 * k / groups.size, 'Verarbeite Dächer', `${k} von ${groups.size} Gebäuden`);
+          await yieldUI();
+        }
+        plan.roofOutlines.push(...unionAll(polys));
+      }
+      // Rasterindex der Flächenmittelpunkte für die Zuordnung
+      const G = 20, grid = new Map();
+      for (const f of plan.roofFaces) {
+        const key = Math.floor(f.c[0] / G) + ':' + Math.floor(f.c[1] / G);
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(f);
+      }
+      for (const b of plan.buildings) {
+        const [x0, y0, x1, y1] = polyBBox(b.poly);
+        search:
+        for (let gx = Math.floor(x0 / G); gx <= Math.floor(x1 / G); gx++) {
+          for (let gy = Math.floor(y0 / G); gy <= Math.floor(y1 / G); gy++) {
+            for (const f of grid.get(gx + ':' + gy) || []) {
+              if (pointInRing(f.c, b.poly[0])) { b.hasRoof = true; break search; }
+            }
+          }
+        }
       }
     }
 
-    progress.set(80, 'Verarbeite Grünflächen und Strassen', '');
+    progress.set(84, 'Verarbeite Grünflächen und Strassen', '');
     await yieldUI();
 
     if (opts.green) {
@@ -746,8 +1000,25 @@ async function generate() {
     if (opts.roads) {
       plan.roadAreas = data.roadAreas.map(projPoly).filter(p => bboxHit(polyBBox(p), padBox));
       plan.roadLines = data.roadLines
-        .map(l => ({ wgs: l.coords, lv: l.coords.map(toLV), ...roadSpec(l.tags) }))
+        .map(l => ({ wgs: l.coords, lv: l.coords.map(toLV), nodes: l.nodes, ...roadSpec(l.tags) }))
         .sort((a, b) => a.rank - b.rank);
+      plan.passages = plan.roadLines.filter(l => l.passage);
+      plan.rails = data.rails.map(r => ({ kind: r.kind, lv: r.coords.map(toLV) }));
+
+      // Fussgängerstreifen: Querungsknoten auf Fahrbahnen, Richtung aus den Nachbarpunkten
+      const zebraIds = new Set(data.crossings.filter(c => isZebra(c.tags)).map(c => c.id));
+      const used = new Set();
+      for (const l of plan.roadLines) {
+        if (l.kind === 'foot' || !l.nodes) continue;
+        l.nodes.forEach((id, i) => {
+          if (!zebraIds.has(id) || used.has(id) || !l.lv[i]) return;
+          const a = l.lv[Math.max(0, i - 1)], b = l.lv[Math.min(l.lv.length - 1, i + 1)];
+          const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+          if (len < 1e-6) return;
+          used.add(id);
+          plan.zebras.push({ e: l.lv[i][0], n: l.lv[i][1], dx: dx / len, dy: dy / len, w: l.innerW || l.outerW });
+        });
+      }
     }
 
     if (opts.trees) {
@@ -757,7 +1028,7 @@ async function generate() {
         const d = d0 > 0.5 && d0 < 40 ? d0 : DEFAULT_TREE_CROWN;
         if (e < bbox[0] - d || e > bbox[2] + d || n < bbox[1] - d || n > bbox[3] + d) continue;
         const h = parseFloat(t.tags.height);
-        plan.trees.push({ e, n, d, h: h > 0 && h < 60 ? h : d * 1.6, seed: Math.floor(e * 13 + n * 7) });
+        plan.trees.push({ e, n, d, h: h > 0 && h < 60 ? h : d * 1.6, seed: Math.abs(Math.floor(e * 13 + n * 7)) });
       }
     }
 
@@ -789,7 +1060,10 @@ async function generate() {
     ui.btnPng.disabled = ui.btnDxf.disabled = false;
     progress.done('Plan erzeugt');
 
-    const summary = `${plan.buildings.length} Gebäude, ${plan.trees.length} Bäume, ` +
+    const roofInfo = needRoofs
+      ? `, ${plan.buildings.filter(b => b.hasRoof).length} davon mit echten Dachflächen`
+      : '';
+    const summary = `${plan.buildings.length} Gebäude${roofInfo}, ${plan.trees.length} Bäume, ` +
       `${plan.roadLines.length} Strassenabschnitte, ${plan.parcels.length} Parzellenflächen.`;
     setStatus(warnings.length ? summary + ' ' + warnings.join(' ') : 'Plan erzeugt: ' + summary, warnings.length > 0);
   } catch (err) {
@@ -813,38 +1087,301 @@ function wgsBounds([minE, minN, maxE, maxN]) {
    Rendering (Canvas, für Vorschau und PNG)
    ========================================================= */
 
-function makePattern(ctx, dpi, kind) {
+/* ---------- Texturen ---------- */
+
+function gauss(rnd) { return (rnd() + rnd() + rnd() - 1.5) * 1.15; }
+
+// Kachelbares Muster. Wiese: Halme in unregelmässigen Büscheln; zwei verschieden grosse,
+// gedrehte Kacheln überlagert ergeben keine sichtbare Wiederholung.
+function makePattern(ctx, dpi, kind, variant = 0) {
   const mm = v => v * dpi / 25.4;
-  const S = Math.max(24, Math.round(mm(8)));
-  const p = document.createElement('canvas');
-  p.width = p.height = S;
-  const c = p.getContext('2d');
-  const rnd = mulberry32(kind.length * 9973 + 7);
+  const rnd = mulberry32(kind.length * 9973 + variant * 7717 + 7);
+  const tile = sizeMm => {
+    const S = Math.max(32, Math.round(mm(sizeMm)));
+    const p = document.createElement('canvas');
+    p.width = p.height = S;
+    return [p, p.getContext('2d'), S];
+  };
+  // Zeichnet eine Form mit Umbruch über die Kachelränder
+  const wrap = (S, x, y, reach, fn) => {
+    x = ((x % S) + S) % S; y = ((y % S) + S) % S;
+    for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) {
+      const sx = x + ox, sy = y + oy;
+      if (sx < -reach || sx > S + reach || sy < -reach || sy > S + reach) continue;
+      fn(sx, sy);
+    }
+  };
 
   if (kind === 'grass') {
-    c.strokeStyle = 'rgba(70, 110, 55, 0.32)';
-    c.lineWidth = Math.max(0.6, mm(0.08));
+    const [p, c, S] = tile(variant ? 37 : 23);
     c.lineCap = 'round';
-    for (let i = 0; i < 55; i++) {
-      const x = rnd() * S, y = rnd() * S;
-      const a = -Math.PI / 2 + (rnd() - 0.5) * 0.9, len = mm(0.3 + rnd() * 0.35);
-      c.beginPath(); c.moveTo(x, y); c.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len); c.stroke();
+    const count = Math.round((S / mm(1)) ** 2 * 0.085);
+    const clusters = Array.from({ length: 4 + Math.floor(rnd() * 5) }, () => [rnd() * S, rnd() * S, mm(1.2 + rnd() * 3.5)]);
+    for (let i = 0; i < count; i++) {
+      let x, y;
+      if (rnd() < 0.72) {
+        const cl = clusters[Math.floor(rnd() * clusters.length)];
+        x = cl[0] + gauss(rnd) * cl[2]; y = cl[1] + gauss(rnd) * cl[2];
+      } else { x = rnd() * S; y = rnd() * S; }
+      const a = -Math.PI / 2 + (rnd() - 0.5) * 1.3, len = mm(0.22 + rnd() * 0.5);
+      const light = rnd() < 0.22;
+      c.strokeStyle = light ? `rgba(244,250,226,${0.35 + rnd() * 0.3})` : `rgba(64,102,48,${0.14 + rnd() * 0.26})`;
+      c.lineWidth = Math.max(0.5, mm(0.05 + rnd() * 0.06));
+      const dx = Math.cos(a) * len, dy = Math.sin(a) * len;
+      wrap(S, x, y, len, (sx, sy) => { c.beginPath(); c.moveTo(sx, sy); c.lineTo(sx + dx, sy + dy); c.stroke(); });
     }
-  } else if (kind === 'forest') {
-    c.strokeStyle = 'rgba(60, 95, 50, 0.35)';
-    c.lineWidth = Math.max(0.6, mm(0.08));
-    for (let i = 0; i < 9; i++) {
-      const x = rnd() * S, y = rnd() * S, r = mm(0.5 + rnd() * 0.7);
-      c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.stroke();
+    return ctx.createPattern(p, 'repeat');
+  }
+  if (kind === 'forest') {
+    const [p, c, S] = tile(19);
+    for (let i = 0; i < 16; i++) {
+      const r = mm(0.5 + rnd() * 1.1);
+      c.strokeStyle = `rgba(52,88,46,${0.2 + rnd() * 0.2})`;
+      c.lineWidth = Math.max(0.6, mm(0.08));
+      wrap(S, rnd() * S, rnd() * S, r, (sx, sy) => { c.beginPath(); c.arc(sx, sy, r, 0, Math.PI * 2); c.stroke(); });
     }
-  } else { // paving
-    const s = Math.max(1, mm(0.07));
-    for (let i = 0; i < 420; i++) {
-      c.fillStyle = `rgba(0,0,0,${0.03 + rnd() * 0.06})`;
-      c.fillRect(rnd() * S, rnd() * S, s, s);
-    }
+    return ctx.createPattern(p, 'repeat');
+  }
+  // Belag
+  const [p, c, S] = tile(8);
+  const d = Math.max(1, mm(0.07));
+  for (let i = 0; i < 420; i++) {
+    c.fillStyle = `rgba(0,0,0,${0.03 + rnd() * 0.06})`;
+    c.fillRect(rnd() * S, rnd() * S, d, d);
   }
   return ctx.createPattern(p, 'repeat');
+}
+
+// Weiche, grossflächige Helligkeitsflecken (wie unregelmässiger Rasen)
+function mottle(c, W, H, cell, seed, dark, light, amp) {
+  cell = Math.max(3, cell);
+  const w = Math.ceil(W / cell) + 3, h = Math.ceil(H / cell) + 3;
+  const nc = document.createElement('canvas');
+  nc.width = w; nc.height = h;
+  const x = nc.getContext('2d');
+  const img = x.createImageData(w, h);
+  const rnd = mulberry32(seed);
+  for (let i = 0; i < w * h; i++) {
+    const v = rnd(), k = i * 4;
+    const col = v < 0.5 ? dark : light;
+    img.data[k] = col[0]; img.data[k + 1] = col[1]; img.data[k + 2] = col[2];
+    img.data[k + 3] = Math.round(Math.abs(v - 0.5) * 2 * amp * 255);
+  }
+  x.putImageData(img, 0, 0);
+  c.save();
+  c.imageSmoothingEnabled = true;
+  c.imageSmoothingQuality = 'high';
+  c.drawImage(nc, -cell * 1.5, -cell * 1.5, w * cell, h * cell);
+  c.restore();
+}
+
+/* ---------- Bäume ---------- */
+
+const TREE_STYLES = [
+  { id: 'leaf', label: 'Laubkrone', kind: 'Bild' },
+  { id: 'water', label: 'Aquarell', kind: 'Bild' },
+  { id: 'conifer', label: 'Nadelbaum', kind: 'Bild' },
+  { id: 'line', label: 'Linie', kind: 'Vektor' },
+  { id: 'cloud', label: 'Wolke', kind: 'Vektor' }
+];
+const RASTER_TREES = new Set(['leaf', 'water', 'conifer']);
+let treeStyle = 'leaf';
+const spriteCache = new Map();
+
+const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
+const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+// Gerenderte Baumbilder, zwischengespeichert nach Stil, Grösse, Variante und Sonnenstand
+function treeSprite(style, rpx, variant, sun) {
+  const rb = Math.max(4, Math.round(rpx / 3) * 3);
+  const key = `${style}|${rb}|${variant}|${sun.toSun.join()}`;
+  let sp = spriteCache.get(key);
+  if (sp) return sp;
+  if (spriteCache.size > 500) spriteCache.clear();
+  const pad = Math.ceil(rb * 0.2) + 2, S = 2 * (rb + pad);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const c = cv.getContext('2d');
+  const rnd = mulberry32(variant * 7919 + rb * 31 + style.length * 1013);
+  const lx = sun.toSun[0], ly = -sun.toSun[1]; // Lichtrichtung in Bildkoordinaten
+  if (style === 'leaf') paintLeaf(c, S / 2, S / 2, rb, rnd, lx, ly);
+  else if (style === 'water') paintWatercolor(c, S / 2, S / 2, rb, rnd, lx, ly);
+  else paintConifer(c, S / 2, S / 2, rb, rnd, lx, ly);
+  sp = { canvas: cv, scale: rpx / rb };
+  spriteCache.set(key, sp);
+  return sp;
+}
+
+function paintLeaf(c, cx, cy, R, rnd, lx, ly) {
+  // dunkler Kern, darüber Blattbüschel, beleuchtete Büschel zuletzt
+  c.fillStyle = 'rgba(46,72,40,0.95)';
+  c.beginPath(); c.arc(cx, cy, R * 0.72, 0, Math.PI * 2); c.fill();
+  const n = Math.min(110, Math.round(26 + R * 0.7));
+  const blobs = [];
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * Math.PI * 2, d = R * 0.8 * Math.sqrt(rnd());
+    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
+    const lit = ((x - cx) * lx + (y - cy) * ly) / R + (rnd() - 0.5) * 0.5;
+    blobs.push({ x, y, r: R * (0.17 + rnd() * 0.15), lit });
+  }
+  blobs.sort((p, q) => p.lit - q.lit);
+  for (const b of blobs) {
+    const t = Math.max(0, Math.min(1, (b.lit + 1) / 2));
+    const col = mix([58, 88, 46], [158, 190, 112], t);
+    const g = c.createRadialGradient(b.x + lx * b.r * 0.35, b.y + ly * b.r * 0.35, b.r * 0.05, b.x, b.y, b.r);
+    g.addColorStop(0, rgba(mix(col, [235, 245, 200], 0.35), 1));
+    g.addColorStop(0.65, rgba(col, 1));
+    g.addColorStop(1, rgba(mix(col, [30, 50, 28], 0.4), 0));
+    c.fillStyle = g;
+    c.beginPath(); c.arc(b.x, b.y, b.r, 0, Math.PI * 2); c.fill();
+  }
+  const m = Math.min(700, Math.round(R * R * 0.3));
+  const sz = Math.max(0.7, R * 0.022);
+  for (let i = 0; i < m; i++) {
+    const a = rnd() * Math.PI * 2, d = R * 0.95 * Math.sqrt(rnd());
+    c.fillStyle = rnd() < 0.5 ? 'rgba(230,242,190,0.35)' : 'rgba(30,52,26,0.3)';
+    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz);
+  }
+}
+
+function paintWatercolor(c, cx, cy, R, rnd, lx, ly) {
+  const blob = (rad, ox, oy, wob) => {
+    const ph = [rnd() * 6.3, rnd() * 6.3, rnd() * 6.3];
+    c.beginPath();
+    for (let i = 0; i <= 64; i++) {
+      const a = i / 64 * Math.PI * 2;
+      const k = rad * (1 + wob * (0.5 * Math.sin(3 * a + ph[0]) + 0.3 * Math.sin(5 * a + ph[1]) + 0.2 * Math.sin(8 * a + ph[2])) + (rnd() - 0.5) * wob * 0.3 * rad / rad);
+      const x = cx + ox + Math.cos(a) * k, y = cy + oy + Math.sin(a) * k;
+      i ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.closePath();
+  };
+  for (let i = 0; i < 5; i++) {
+    blob(R * (0.86 + rnd() * 0.12), (rnd() - 0.5) * R * 0.1, (rnd() - 0.5) * R * 0.1, 0.09);
+    c.fillStyle = 'rgba(112,158,104,0.2)';
+    c.fill();
+    c.strokeStyle = 'rgba(62,108,70,0.22)'; // dunklerer Rand wie getrocknete Farbe
+    c.lineWidth = Math.max(0.8, R * 0.035);
+    c.stroke();
+  }
+  // Schattenseite und Lichtseite
+  blob(R * 0.55, -lx * R * 0.28, -ly * R * 0.28, 0.12);
+  c.fillStyle = 'rgba(52,96,72,0.22)'; c.fill();
+  blob(R * 0.45, lx * R * 0.3, ly * R * 0.3, 0.14);
+  c.fillStyle = 'rgba(214,232,170,0.35)'; c.fill();
+  // Pigmentkörnung
+  const m = Math.min(500, Math.round(R * R * 0.18));
+  for (let i = 0; i < m; i++) {
+    const a = rnd() * Math.PI * 2, d = R * 0.9 * Math.sqrt(rnd());
+    c.fillStyle = `rgba(40,80,50,${0.08 + rnd() * 0.12})`;
+    const sz = Math.max(0.6, R * 0.018);
+    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz);
+  }
+}
+
+function paintConifer(c, cx, cy, R, rnd, lx, ly) {
+  const spikes = 13 + Math.floor(rnd() * 5);
+  c.beginPath();
+  for (let i = 0; i <= spikes * 2; i++) {
+    const a = i / (spikes * 2) * Math.PI * 2;
+    const k = i % 2 ? R * (0.62 + rnd() * 0.1) : R * (0.9 + rnd() * 0.1);
+    const x = cx + Math.cos(a) * k, y = cy + Math.sin(a) * k;
+    i ? c.lineTo(x, y) : c.moveTo(x, y);
+  }
+  c.closePath();
+  c.fillStyle = 'rgba(34,62,44,0.95)';
+  c.fill();
+  const n = Math.min(260, Math.round(R * 5));
+  c.lineCap = 'round';
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * Math.PI * 2;
+    const r0 = R * (0.05 + rnd() * 0.3), r1 = R * (0.6 + rnd() * 0.38);
+    const lit = Math.cos(a) * lx + Math.sin(a) * ly;
+    const col = mix([30, 60, 42], [128, 168, 110], Math.max(0, Math.min(1, (lit + 1) / 2 + (rnd() - 0.5) * 0.3)));
+    c.strokeStyle = rgba(col, 0.75);
+    c.lineWidth = Math.max(0.6, R * (0.02 + rnd() * 0.02));
+    const bend = (rnd() - 0.5) * 0.25;
+    c.beginPath();
+    c.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+    c.quadraticCurveTo(cx + Math.cos(a + bend) * (r0 + r1) / 2, cy + Math.sin(a + bend) * (r0 + r1) / 2,
+      cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
+    c.stroke();
+  }
+  c.fillStyle = 'rgba(70,52,36,0.9)';
+  c.beginPath(); c.arc(cx, cy, Math.max(0.8, R * 0.06), 0, Math.PI * 2); c.fill();
+}
+
+// Vektorbäume als Geometrie relativ zum Stammpunkt (Einheiten frei, y nach oben)
+function treeVector(style, r, seed) {
+  const rnd = mulberry32(seed + 17);
+  if (style === 'line') {
+    const lines = [];
+    const n = 6 + Math.floor(rnd() * 3), ph = rnd() * Math.PI * 2;
+    const P = (a, k) => [Math.cos(a) * r * k, Math.sin(a) * r * k];
+    for (let i = 0; i < n; i++) {
+      const a = ph + i * Math.PI * 2 / n + (rnd() - 0.5) * 0.3;
+      const fork = P(a, 0.5 + rnd() * 0.1);
+      lines.push([P(a, 0.12), fork]);
+      lines.push([fork, P(a - 0.22, 0.8)]);
+      lines.push([fork, P(a + 0.22, 0.8)]);
+    }
+    return { circles: [r], dot: r * 0.08, rings: [], lines };
+  }
+  const lobes = 9 + Math.floor(rnd() * 4), ph = rnd() * Math.PI * 2;
+  const pts = [];
+  for (let k = 0; k < lobes; k++) {
+    const a0 = ph + k * Math.PI * 2 / lobes, a1 = ph + (k + 1) * Math.PI * 2 / lobes;
+    const amp = 0.09 + rnd() * 0.05;
+    for (let j = 0; j < 8; j++) {
+      const u = j / 8, a = a0 + (a1 - a0) * u;
+      const rr = r * (1 - amp + amp * Math.sin(Math.PI * u));
+      pts.push([Math.cos(a) * rr, Math.sin(a) * rr]);
+    }
+  }
+  pts.push(pts[0]);
+  return { circles: [], dot: r * 0.06, rings: [pts], lines: [] };
+}
+
+function drawTree(c, style, x, y, rpx, seed, mm, sun) {
+  if (RASTER_TREES.has(style)) {
+    const sp = treeSprite(style, rpx, seed % 4, sun);
+    const S = sp.canvas.width * sp.scale;
+    c.drawImage(sp.canvas, x - S / 2, y - S / 2, S, S);
+    return;
+  }
+  const g = treeVector(style, rpx, seed);
+  if (style === 'cloud') {
+    c.beginPath();
+    g.rings[0].forEach(([px, py], i) => i ? c.lineTo(x + px, y - py) : c.moveTo(x + px, y - py));
+    c.closePath();
+    c.fillStyle = 'rgba(198,220,180,0.93)';
+    c.fill();
+    c.strokeStyle = '#2f4a2a';
+    c.lineWidth = mm(0.13);
+    c.stroke();
+    c.beginPath(); c.arc(x, y, Math.max(mm(0.3), g.dot), 0, Math.PI * 2);
+    c.fillStyle = '#2f4a2a'; c.fill();
+    return;
+  }
+  c.beginPath(); c.arc(x, y, rpx, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255,255,255,0.55)'; c.fill();
+  c.strokeStyle = '#1f1f1e'; c.lineWidth = mm(0.13); c.stroke();
+  c.lineWidth = mm(0.08);
+  c.lineCap = 'round';
+  c.beginPath();
+  for (const [a, b] of g.lines) { c.moveTo(x + a[0], y - a[1]); c.lineTo(x + b[0], y - b[1]); }
+  c.stroke();
+  c.beginPath(); c.arc(x, y, Math.max(mm(0.3), g.dot), 0, Math.PI * 2); c.stroke();
+}
+
+/* ---------- Plan zeichnen ---------- */
+
+function faceShade(f, sun) {
+  if (!f.dir) return 'rgb(244,244,242)';
+  const dot = f.dir[0] * sun.toSun[0] + f.dir[1] * sun.toSun[1];
+  const k = Math.min(1, (f.tilt || 30) / 35);
+  const v = Math.round(236 + 18 * dot * k);
+  return `rgb(${v},${v},${v - 2})`;
 }
 
 function drawPlan(canvas, plan, dpi, o) {
@@ -861,20 +1398,21 @@ function drawPlan(canvas, plan, dpi, o) {
   const Y = n => (maxN - n) * pxPerM;
   const sun = sunVectors(o.sun);
 
-  // Eine Zwischenebene für Texturen und Schatten
   const layer = document.createElement('canvas');
   layer.width = W; layer.height = H;
   const lc = layer.getContext('2d');
-  const composite = (draw, pattern, alpha = 1) => {
+  // Ebene zeichnen, Textur nur auf die gezeichneten Pixel legen, dann einblenden
+  const composite = (draw, texture, alpha = 1) => {
     lc.globalCompositeOperation = 'source-over';
     lc.clearRect(0, 0, W, H);
-    lc.lineJoin = 'round'; lc.lineCap = 'round';
+    lc.lineJoin = 'round'; lc.lineCap = 'round'; lc.setLineDash([]);
     draw(lc);
-    if (pattern) {
+    if (texture) {
+      lc.save();
       lc.globalCompositeOperation = 'source-atop';
-      lc.fillStyle = pattern;
-      lc.fillRect(0, 0, W, H);
-      lc.globalCompositeOperation = 'source-over';
+      if (typeof texture === 'function') texture(lc);
+      else { lc.fillStyle = texture; lc.fillRect(0, 0, W, H); }
+      lc.restore();
     }
     ctx.save(); ctx.globalAlpha = alpha; ctx.drawImage(layer, 0, 0); ctx.restore();
   };
@@ -891,6 +1429,10 @@ function drawPlan(canvas, plan, dpi, o) {
       if (stroke) { c.strokeStyle = stroke; c.lineWidth = lw; c.stroke(); }
     }
   };
+  const linePath = (c, pts) => {
+    c.beginPath();
+    pts.forEach(([e, n], i) => i ? c.lineTo(X(e), Y(n)) : c.moveTo(X(e), Y(n)));
+  };
 
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, W, H);
@@ -899,14 +1441,38 @@ function drawPlan(canvas, plan, dpi, o) {
 
   const greens = kind => plan.green.filter(g => g.kind === kind).map(g => g.poly);
 
-  // Wasser, Wiese, Wald
+  // Wasser
   fillStroke(ctx, greens('water'), COL.water, COL.waterEdge, mm(0.15));
-  composite(c => fillStroke(c, greens('grass'), COL.grass, COL.grassEdge, mm(0.13)),
-    o.texture ? makePattern(ctx, dpi, 'grass') : null);
-  composite(c => fillStroke(c, greens('forest'), COL.forest, COL.forestEdge, mm(0.13)),
-    o.texture ? makePattern(ctx, dpi, 'forest') : null);
 
-  // Strassen: Rand, Belag, Trottoirkante, Fahrbahn
+  // Wiese: grosse und kleine Flecken, zwei gedrehte Halmmuster
+  const grassTex = o.texture ? c => {
+    mottle(c, W, H, mm(11), 11, [70, 108, 52], [250, 252, 236], 0.3);
+    mottle(c, W, H, mm(3.2), 12, [70, 108, 52], [250, 252, 236], 0.14);
+    const p1 = makePattern(ctx, dpi, 'grass', 0);
+    const p2 = makePattern(ctx, dpi, 'grass', 1);
+    p1.setTransform(new DOMMatrix().rotate(13));
+    p2.setTransform(new DOMMatrix().translate(mm(5), mm(11)).rotate(-29));
+    c.fillStyle = p1; c.fillRect(0, 0, W, H);
+    c.fillStyle = p2; c.fillRect(0, 0, W, H);
+  } : null;
+  composite(c => fillStroke(c, greens('grass'), COL.grass, COL.grassEdge, mm(0.13)), grassTex);
+
+  const forestTex = o.texture ? c => {
+    mottle(c, W, H, mm(8), 21, [40, 72, 36], [236, 246, 222], 0.3);
+    const pf = makePattern(ctx, dpi, 'forest');
+    pf.setTransform(new DOMMatrix().rotate(21));
+    c.fillStyle = pf; c.fillRect(0, 0, W, H);
+  } : null;
+  composite(c => fillStroke(c, greens('forest'), COL.forest, COL.forestEdge, mm(0.13)), forestTex);
+
+  // Schotterbett der Eisenbahn
+  for (const r of plan.rails) {
+    if (r.kind === 'tram') continue;
+    linePath(ctx, r.lv);
+    ctx.lineWidth = 3.4 * pxPerM; ctx.strokeStyle = '#dcd8cf'; ctx.stroke();
+  }
+
+  // Strassen
   composite(c => {
     fillStroke(c, plan.roadAreas, COL.paved, COL.edge, mm(0.15));
     const strokeLine = (l, w, col) => {
@@ -914,13 +1480,44 @@ function drawPlan(canvas, plan, dpi, o) {
       l.lv.forEach(([e, n], i) => i ? c.lineTo(X(e), Y(n)) : c.moveTo(X(e), Y(n)));
       c.lineWidth = w; c.strokeStyle = col; c.stroke();
     };
-    const edge = mm(0.18), curb = mm(0.12);
+    const edge = mm(0.2), curb = mm(0.12);
     for (const l of plan.roadLines) strokeLine(l, l.outerW * pxPerM + 2 * edge, COL.edge);
     for (const l of plan.roadLines) strokeLine(l, l.outerW * pxPerM,
       l.innerW || l.kind === 'foot' ? COL.sidewalk : COL.carriage);
     for (const l of plan.roadLines) if (l.innerW) strokeLine(l, l.innerW * pxPerM + 2 * curb, COL.curb);
     for (const l of plan.roadLines) if (l.innerW) strokeLine(l, l.innerW * pxPerM, COL.carriage);
+
+    if (o.detail) {
+      // Mittellinien
+      c.lineCap = 'butt';
+      c.setLineDash([3 * pxPerM, 6 * pxPerM]);
+      for (const l of plan.roadLines) {
+        if ((l.kind === 'major' || l.kind === 'minor') && !l.oneway && (l.innerW || l.outerW) >= 6) {
+          strokeLine(l, Math.max(mm(0.1), 0.12 * pxPerM), 'rgba(255,255,255,0.9)');
+        }
+      }
+      c.setLineDash([]);
+      c.lineCap = 'round';
+      // Fussgängerstreifen (in der Schweiz gelb)
+      c.fillStyle = '#efe0a0';
+      for (const z of plan.zebras) {
+        const nx = -z.dy, ny = z.dx;
+        for (let t = -z.w / 2 + 0.25; t <= z.w / 2 - 0.25; t += 1.0) {
+          const cx = z.e + nx * t, cy = z.n + ny * t;
+          const pts = [[2, 0.25], [2, -0.25], [-2, -0.25], [-2, 0.25]]
+            .map(([u, v]) => [cx + z.dx * u + nx * v, cy + z.dy * u + ny * v]);
+          c.beginPath(); traceRing(c, pts); c.fill();
+        }
+      }
+    }
   }, o.texture ? makePattern(ctx, dpi, 'paving') : null);
+
+  // Gleise
+  ctx.strokeStyle = '#5b5b58';
+  ctx.lineWidth = mm(0.1);
+  for (const r of plan.rails) {
+    for (const s of [-0.72, 0.72]) { linePath(ctx, offsetPolyline(r.lv, s)); ctx.stroke(); }
+  }
 
   // Schatten von Gebäuden und Bäumen
   if (o.shadow) {
@@ -942,7 +1539,7 @@ function drawPlan(canvas, plan, dpi, o) {
       for (const t of plan.trees) {
         const len = t.h * SHADOW_FACTOR * 0.8 * pxPerM;
         c.beginPath();
-        c.arc(X(t.e) + sun.shadow[0] * len, Y(t.n) - sun.shadow[1] * len, t.d / 2 * pxPerM, 0, Math.PI * 2);
+        c.arc(X(t.e) + sun.shadow[0] * len, Y(t.n) - sun.shadow[1] * len, t.d / 2 * pxPerM * 0.95, 0, Math.PI * 2);
         c.fill();
       }
     }, null, 0.2);
@@ -952,15 +1549,27 @@ function drawPlan(canvas, plan, dpi, o) {
   fillStroke(ctx, plan.parcels, null, COL.parcel, mm(0.1));
 
   // Bäume
-  for (const t of plan.trees) {
-    const r = t.d / 2 * pxPerM;
-    if (o.detail) drawTreeDetailed(ctx, X(t.e), Y(t.n), r, t.seed, mm, sun);
-    else drawTreeSimple(ctx, X(t.e), Y(t.n), r, mm);
-  }
+  for (const t of plan.trees) drawTree(ctx, treeStyle, X(t.e), Y(t.n), t.d / 2 * pxPerM, t.seed, mm, sun);
 
   // Gebäude
+  if (o.roof && plan.roofFaces.length) {
+    for (const f of plan.roofFaces) {
+      ctx.beginPath(); tracePoly(ctx, f.poly);
+      ctx.fillStyle = faceShade(f, sun); ctx.fill('evenodd');
+    }
+    ctx.strokeStyle = '#4a4a47'; ctx.lineWidth = mm(0.1);
+    for (const f of plan.roofFaces) { ctx.beginPath(); tracePoly(ctx, f.poly); ctx.stroke(); }
+    ctx.strokeStyle = '#000'; ctx.lineWidth = mm(0.3);
+    for (const p of plan.roofOutlines) { ctx.beginPath(); tracePoly(ctx, p); ctx.stroke(); }
+  }
   for (const b of plan.buildings) {
-    if (o.roof) {
+    if (o.roof && b.hasRoof && plan.roofFaces.length) {
+      // Fassade unter dem Dachvorsprung gestrichelt
+      ctx.setLineDash([mm(1.2), mm(0.8)]);
+      ctx.beginPath(); tracePoly(ctx, b.poly);
+      ctx.strokeStyle = '#555'; ctx.lineWidth = mm(0.12); ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (o.roof) {
       ctx.save();
       ctx.beginPath(); tracePoly(ctx, b.poly); ctx.clip('evenodd');
       for (const f of b.roof.faces) {
@@ -988,11 +1597,36 @@ function drawPlan(canvas, plan, dpi, o) {
     }
   }
 
+  // Lauben und Durchgänge unter Gebäuden, gestrichelt
+  if (o.roof) {
+    ctx.setLineDash([mm(1), mm(0.7)]);
+    ctx.strokeStyle = '#333'; ctx.lineWidth = mm(0.12);
+    for (const l of plan.passages) {
+      for (const sgn of [-1, 1]) { linePath(ctx, offsetPolyline(l.lv, sgn * l.outerW / 2)); ctx.stroke(); }
+    }
+    for (const p of plan.arcades) { ctx.beginPath(); tracePoly(ctx, p); ctx.stroke(); }
+    ctx.setLineDash([]);
+  }
+
+  // Strassennamen
+  ctx.font = `italic 500 ${mm(2.1)}px Archivo, Arial, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const s of streetLabels(plan)) {
+    ctx.save();
+    ctx.translate(X(s.e), Y(s.n));
+    ctx.rotate(-s.ang);
+    ctx.lineWidth = mm(0.5);
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.strokeText(s.name, 0, 0);
+    ctx.fillStyle = '#3a3a38';
+    ctx.fillText(s.name, 0, 0);
+    ctx.restore();
+  }
+
   // Parzellennummern
   if (plan.labels.length) {
     ctx.font = `italic 500 ${mm(2.2)}px Archivo, Arial, sans-serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
     for (const l of plan.labels) {
       const x = X(l.e), y = Y(l.n);
       ctx.lineWidth = mm(0.6);
@@ -1014,7 +1648,9 @@ function drawPlan(canvas, plan, dpi, o) {
   ctx.textAlign = 'left';
   ctx.textBaseline = 'alphabetic';
   ctx.fillStyle = '#333';
-  const roofNote = o.roof ? ' Dachaufsicht schematisch.' : '';
+  const roofNote = o.roof
+    ? (plan.roofFaces.length ? ' Dachflächen: BFE Sonnendach.ch.' : ' Dachaufsicht schematisch.')
+    : '';
   ctx.fillText(
     `Situation 1:${plan.scale}, LV95. Daten: © swisstopo, © OpenStreetMap-Mitwirkende.${roofNote}`,
     mm(4), H - mm(4)
@@ -1026,62 +1662,6 @@ function roofShade(dir, sun) {
   const dot = dir[0] * sun.toSun[0] + dir[1] * sun.toSun[1];
   const v = Math.round(233 + 17 * dot);
   return `rgb(${v},${v},${v - 2})`;
-}
-
-function drawTreeSimple(c, x, y, r, mm) {
-  c.beginPath();
-  c.arc(x, y, r, 0, Math.PI * 2);
-  c.fillStyle = 'rgba(120, 160, 105, 0.35)';
-  c.fill();
-  c.strokeStyle = COL.treeEdge;
-  c.lineWidth = mm(0.13);
-  c.stroke();
-  c.beginPath();
-  c.arc(x, y, mm(0.25), 0, Math.PI * 2);
-  c.fillStyle = COL.treeEdge;
-  c.fill();
-}
-
-function drawTreeDetailed(c, x, y, r, seed, mm, sun) {
-  const rnd = mulberry32(seed);
-  const lobes = 6 + Math.floor(rnd() * 4), ph = rnd() * Math.PI * 2;
-  const crown = (rad, amp) => {
-    c.beginPath();
-    for (let i = 0; i <= 90; i++) {
-      const a = i / 90 * Math.PI * 2;
-      const k = rad * (1 - amp + amp * Math.abs(Math.cos(lobes * a / 2 + ph)));
-      const px = x + Math.cos(a) * k, py = y + Math.sin(a) * k;
-      i ? c.lineTo(px, py) : c.moveTo(px, py);
-    }
-    c.closePath();
-  };
-  // Lichtpunkt zur Sonne hin
-  const hx = x + sun.toSun[0] * r * 0.3, hy = y - sun.toSun[1] * r * 0.3;
-  const g = c.createRadialGradient(hx, hy, r * 0.1, x, y, r);
-  g.addColorStop(0, 'rgba(204, 222, 186, 0.93)');
-  g.addColorStop(1, 'rgba(146, 178, 128, 0.93)');
-  crown(r, 0.12);
-  c.fillStyle = g; c.fill();
-  c.strokeStyle = COL.treeEdge; c.lineWidth = mm(0.13); c.stroke();
-
-  crown(r * 0.6, 0.2);
-  c.strokeStyle = 'rgba(79, 111, 69, 0.4)'; c.lineWidth = mm(0.08); c.stroke();
-
-  const nb = 5 + Math.floor(rnd() * 3);
-  c.strokeStyle = 'rgba(66, 94, 56, 0.55)';
-  c.lineWidth = mm(0.1);
-  for (let i = 0; i < nb; i++) {
-    const a = ph + i * Math.PI * 2 / nb + (rnd() - 0.5) * 0.5;
-    c.beginPath();
-    c.moveTo(x, y);
-    c.quadraticCurveTo(x + Math.cos(a + 0.2) * r * 0.4, y + Math.sin(a + 0.2) * r * 0.4,
-      x + Math.cos(a) * r * 0.78, y + Math.sin(a) * r * 0.78);
-    c.stroke();
-  }
-  c.beginPath();
-  c.arc(x, y, Math.max(mm(0.35), r * 0.07), 0, Math.PI * 2);
-  c.fillStyle = '#3f5a37';
-  c.fill();
 }
 
 function drawNorthArrow(ctx, cx, cy, mm) {
@@ -1271,13 +1851,16 @@ async function buildDXF(plan, o) {
   const [minE, minN, maxE, maxN] = bbox;
   const sun = sunVectors(o.sun);
 
+  // Layername, ACI-Farbe, Linientyp
   const layers = [
-    ['RAHMEN', 7], ['GEBAEUDE', 7], ['GEBAEUDE_FUELLUNG', 7], ['DACH', 8],
+    ['RAHMEN', 7], ['GEBAEUDE', 7], ['GEBAEUDE_FUELLUNG', 7], ['GEBAEUDE_FASSADE', 8, 'DASHED'],
+    ['DACH', 8], ['DACH_UMRISS', 7], ['LAUBEN', 8, 'DASHED'],
     ['SCHATTEN', 9], ['SCHATTEN_FUELLUNG', 254],
-    ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9],
+    ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9], ['BAHN', 8], ['STRASSENNAMEN', 7],
     ['GRUEN', 3], ['WALD', 94], ['WASSER', 5], ['BAEUME', 94],
     ['PARZELLEN', 7], ['PARZELLEN_NR', 7]
   ];
+  const dash = 1.2 * plan.scale / 1000, gap = 0.8 * plan.scale / 1000;
 
   g(0, 'SECTION'); g(2, 'HEADER');
   g(9, '$ACADVER'); g(1, 'AC1009');
@@ -1287,12 +1870,14 @@ async function buildDXF(plan, o) {
   g(0, 'ENDSEC');
 
   g(0, 'SECTION'); g(2, 'TABLES');
-  g(0, 'TABLE'); g(2, 'LTYPE'); g(70, 1);
+  g(0, 'TABLE'); g(2, 'LTYPE'); g(70, 2);
   g(0, 'LTYPE'); g(2, 'CONTINUOUS'); g(70, 0); g(3, 'Solid line'); g(72, 65); g(73, 0); g(40, '0.0');
+  g(0, 'LTYPE'); g(2, 'DASHED'); g(70, 0); g(3, 'Dashed'); g(72, 65); g(73, 2);
+  g(40, f(dash + gap)); g(49, f(dash)); g(49, f(-gap));
   g(0, 'ENDTAB');
   g(0, 'TABLE'); g(2, 'LAYER'); g(70, layers.length);
-  for (const [name, color] of layers) {
-    g(0, 'LAYER'); g(2, name); g(70, 0); g(62, color); g(6, 'CONTINUOUS');
+  for (const [name, color, lt] of layers) {
+    g(0, 'LAYER'); g(2, name); g(70, 0); g(62, color); g(6, lt || 'CONTINUOUS');
   }
   g(0, 'ENDTAB');
   g(0, 'TABLE'); g(2, 'STYLE'); g(70, 1);
@@ -1307,6 +1892,14 @@ async function buildDXF(plan, o) {
     const pts = samePt(ring[0], ring[ring.length - 1]) ? ring.slice(0, -1) : ring;
     if (pts.length < 2) return;
     g(0, 'POLYLINE'); g(8, layer); g(66, 1); g(10, '0.0'); g(20, '0.0'); g(30, '0.0'); g(70, 1);
+    for (const [x, y] of pts) {
+      g(0, 'VERTEX'); g(8, layer); g(10, f(x)); g(20, f(y)); g(30, '0.0');
+    }
+    g(0, 'SEQEND'); g(8, layer);
+  };
+  const plineOpen = (layer, pts) => {
+    if (pts.length < 2) return;
+    g(0, 'POLYLINE'); g(8, layer); g(66, 1); g(10, '0.0'); g(20, '0.0'); g(30, '0.0'); g(70, 0);
     for (const [x, y] of pts) {
       g(0, 'VERTEX'); g(8, layer); g(10, f(x)); g(20, f(y)); g(30, '0.0');
     }
@@ -1351,6 +1944,10 @@ async function buildDXF(plan, o) {
     for (const p of roads.inner) p.forEach(r => pline('TROTTOIRKANTE', r));
   }
 
+  for (const r of plan.rails) {
+    for (const sgn of [-0.72, 0.72]) for (const part of clipLine(offsetPolyline(r.lv, sgn), bbox)) plineOpen('BAHN', part);
+  }
+
   for (const p of plan.parcels) p.forEach(r => pline('PARZELLEN', r));
 
   if (o.shadow && plan.buildings.length) {
@@ -1362,8 +1959,17 @@ async function buildDXF(plan, o) {
 
   progress.set(90, 'Erzeuge DXF', 'Gebäude und Dächer …');
   await yieldUI();
+  const realRoofs = o.roof && plan.roofFaces.length > 0;
+  if (realRoofs) {
+    for (const fc of plan.roofFaces) for (const p of clipPolys([fc.poly], bbox)) p.forEach(r => pline('DACH', r));
+    for (const p of clipPolys(plan.roofOutlines, bbox)) p.forEach(r => pline('DACH_UMRISS', r));
+  }
   for (const b of plan.buildings) {
     const clipped = clipPolys([b.poly], bbox);
+    if (realRoofs && b.hasRoof) {
+      for (const p of clipped) p.forEach(r => pline('GEBAEUDE_FASSADE', r));
+      continue;
+    }
     for (const p of clipped) {
       p.forEach(r => pline('GEBAEUDE', r));
       if (!o.roof) solids('GEBAEUDE_FUELLUNG', p);
@@ -1377,10 +1983,35 @@ async function buildDXF(plan, o) {
     }
   }
 
+  if (o.roof) {
+    for (const l of plan.passages) {
+      for (const sgn of [-1, 1]) for (const part of clipLine(offsetPolyline(l.lv, sgn * l.outerW / 2), bbox)) plineOpen('LAUBEN', part);
+    }
+    for (const p of clipPolys(plan.arcades, bbox)) p.forEach(r => pline('LAUBEN', r));
+  }
+
   for (const t of plan.trees) {
     if (t.e < minE || t.e > maxE || t.n < minN || t.n > maxN) continue;
-    g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(t.d / 2));
+    const r = t.d / 2;
+    if (treeStyle === 'cloud') {
+      const gm = treeVector('cloud', r, t.seed);
+      pline('BAEUME', gm.rings[0].map(([x, y]) => [t.e + x, t.n + y]));
+    } else {
+      g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r));
+      if (treeStyle === 'line') {
+        for (const [a, b] of treeVector('line', r, t.seed).lines) line('BAEUME', [t.e + a[0], t.n + a[1]], [t.e + b[0], t.n + b[1]]);
+      }
+    }
     g(0, 'POINT'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0');
+  }
+
+  const nameH = 2.1 * plan.scale / 1000;
+  for (const sl of streetLabels(plan)) {
+    g(0, 'TEXT'); g(8, 'STRASSENNAMEN');
+    g(10, f(sl.e)); g(20, f(sl.n)); g(30, '0.0');
+    g(40, f(nameH)); g(1, asciiSafe(sl.name)); g(50, f(sl.ang * 180 / Math.PI));
+    g(72, 1); g(73, 2);
+    g(11, f(sl.e)); g(21, f(sl.n)); g(31, '0.0');
   }
 
   const textH = 2.2 * plan.scale / 1000;
@@ -1611,5 +2242,6 @@ ui.btnBldg3d = $('btnBldg3d');
 ui.btnCloud.addEventListener('click', () => search3d('cloud'));
 ui.btnBldg3d.addEventListener('click', () => search3d('bldg'));
 
+buildTreePicker();
 applyStylePreset();
 updatePerimeter();
