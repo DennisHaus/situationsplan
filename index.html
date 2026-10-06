@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="de-CH">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lageplan-Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="panel">
+      <header class="titleblock">
+        <h1>Lageplan</h1>
+        <p class="sub">Situationsplan aus OpenStreetMap und swisstopo, als PNG und DXF</p>
+        <dl class="tb-grid">
+          <div><dt>Massstab</dt><dd id="tbScale">1:500</dd></div>
+          <div><dt>Ausschnitt</dt><dd id="tbSize">300 × 200 m</dd></div>
+          <div class="wide"><dt>Zentrum LV95</dt><dd id="tbCenter">–</dd></div>
+        </dl>
+      </header>
+
+      <section class="group">
+        <h2>Ort</h2>
+        <form id="searchForm" class="search">
+          <input id="searchInput" type="search" placeholder="Adresse oder Ort" autocomplete="off" aria-label="Adresse oder Ort">
+          <button type="submit">Suchen</button>
+        </form>
+        <p class="hint">Oder in die Karte klicken, um das Zentrum des Ausschnitts zu setzen.</p>
+      </section>
+
+      <section class="group">
+        <h2>Ausschnitt</h2>
+        <div class="row3">
+          <label>Breite (m)<input id="width" type="number" min="50" max="1500" step="10" value="300"></label>
+          <label>Höhe (m)<input id="height" type="number" min="50" max="1500" step="10" value="200"></label>
+          <label>Massstab
+            <select id="scale">
+              <option value="200">1:200</option>
+              <option value="500" selected>1:500</option>
+              <option value="1000">1:1000</option>
+              <option value="2000">1:2000</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>Inhalt</h2>
+        <div class="checks">
+          <label><input type="checkbox" id="lyBuildings" checked> Gebäude (Schwarzplan)</label>
+          <label><input type="checkbox" id="lyRoads" checked> Strassen und Wege</label>
+          <label><input type="checkbox" id="lyGreen" checked> Grünflächen</label>
+          <label><input type="checkbox" id="lyTrees" checked> Bäume</label>
+          <label><input type="checkbox" id="lyParcels" checked> Parzellengrenzen</label>
+          <label><input type="checkbox" id="lyParcelNr" checked> Parzellennummern</label>
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>Export</h2>
+        <label class="inline">PNG-Auflösung
+          <select id="dpi">
+            <option value="150">150 dpi</option>
+            <option value="300" selected>300 dpi</option>
+          </select>
+        </label>
+        <button id="btnGenerate" class="primary">Plan erzeugen</button>
+        <div class="downloads">
+          <button id="btnPng" disabled>PNG herunterladen</button>
+          <button id="btnDxf" disabled>DXF herunterladen</button>
+        </div>
+        <p id="status" class="status" role="status" aria-live="polite"></p>
+      </section>
+
+      <footer class="credits">
+        Daten: © swisstopo, © OpenStreetMap-Mitwirkende (ODbL). Parzellen aus der amtlichen Vermessung, ohne Rechtsgültigkeit.
+      </footer>
+    </aside>
+
+    <main class="stage">
+      <div class="tabs" role="tablist">
+        <button id="tabMap" role="tab" aria-selected="true">Karte</button>
+        <button id="tabPlan" role="tab" aria-selected="false">Plan</button>
+      </div>
+      <div id="map" class="view"></div>
+      <div id="planView" class="view plan" hidden>
+        <p id="planEmpty" class="empty">Noch kein Plan. Ausschnitt wählen und «Plan erzeugen» klicken.</p>
+        <canvas id="preview" hidden></canvas>
+      </div>
+    </main>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/proj4@2.11.0/dist/proj4.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.1.0/turf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
