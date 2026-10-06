@@ -7,6 +7,15 @@
    Läuft komplett im Browser (GitHub Pages tauglich).
    ========================================================= */
 
+/* ---------- Freiwilliger Beitrag ----------
+   Hier deinen PayPal.me-Namen eintragen (der Teil nach paypal.me/).
+   Solange der Platzhalter steht, zeigt das Fenster einen Hinweis statt Links. */
+const DONATE = {
+  paypalMe: 'DEIN-PAYPAL-NAME',
+  currency: 'EUR',
+  amounts: [2, 5, 10, 50]
+};
+
 /* ---------- Koordinatensysteme ---------- */
 proj4.defs('EPSG:2056',
   '+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 ' +
@@ -48,8 +57,8 @@ const SHADOW_FACTOR = 0.55;     // Schattenlänge = Höhe × Faktor
 
 const COL = {
   carriage: '#c9c9c6', sidewalk: '#e1e1de', edge: '#7c7c78', curb: '#a2a29e', paved: '#e1e1de',
-  grass: '#dce8cf', grassEdge: '#a6bf98', forest: '#c3d7b3', forestEdge: '#8cab7d',
-  water: '#d0e2ec', waterEdge: '#85a8bd', parcel: '#2b2b2b', ground: '#eeeeeb',
+  grass: '#dce8cf', grassEdge: '#a6bf98', forest: '#aec59e', forestEdge: '#7e9d70',
+  water: '#d0e2ec', waterDeep: '#b9d3e2', waterEdge: '#6f97ae', parcel: '#2b2b2b', ground: '#eeeeeb',
   treeEdge: '#4f6f45', shadow: '#1d2630'
 };
 
@@ -203,7 +212,76 @@ function buildTreePicker() {
       wrap.appendChild(lab);
     }
   }
+
+  const extra = $('treeExtra');
+  extra.innerHTML = '';
+  for (const st of EXTRA_TREES) {
+    const lab = document.createElement('label');
+    lab.className = 'tree-opt';
+    lab.title = st.label;
+    const inp = document.createElement('input');
+    inp.type = 'radio'; inp.name = 'treeStyle'; inp.value = st.id;
+    inp.checked = st.id === treeStyle;
+    inp.setAttribute('aria-label', st.label);
+    inp.addEventListener('change', () => {
+      treeStyle = st.id;
+      if (st.id === 'custom' && !customTree.img) $('treeFile').click();
+      renderPreview();
+    });
+    const cv = document.createElement('canvas');
+    cv.width = cv.height = Math.round(48 * dpr);
+    const c = cv.getContext('2d');
+    c.fillStyle = '#fff';
+    c.fillRect(0, 0, cv.width, cv.height);
+    const r = 6, pxPerM = 19 * dpr / r;
+    drawTree(c, st.id, cv.width / 2, cv.height / 2, r, 11, pxPerM, mmv => mmv * 3.4 * dpr, sun);
+    const cap = document.createElement('span');
+    cap.textContent = st.label;
+    lab.append(inp, cv, cap);
+    extra.appendChild(lab);
+  }
 }
+
+/* ---------- Eigenes Baumsymbol ---------- */
+const CUSTOM_KEY = 'lageplan.customTree';
+
+function setCustomTreeImage(dataUrl, select) {
+  const im = new Image();
+  im.onload = () => {
+    customTree.img = im;
+    if (select) treeStyle = 'custom';
+    buildTreePicker();
+    renderPreview();
+  };
+  im.onerror = () => setStatus('Das Bild konnte nicht gelesen werden. Bitte PNG, JPG, WebP oder SVG verwenden.', true);
+  im.src = dataUrl;
+}
+
+$('treeUpload').addEventListener('click', () => $('treeFile').click());
+$('treeFile').addEventListener('change', ev => {
+  const file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  if (file.size > 15e6) { setStatus('Das Bild ist sehr gross (über 15 MB). Bitte eine kleinere Datei wählen.', true); return; }
+  const rd = new FileReader();
+  rd.onload = () => {
+    const data = rd.result;
+    try {
+      localStorage.setItem(CUSTOM_KEY, data);
+      setStatus('Eigenes Baumsymbol geladen und gespeichert.');
+    } catch (e) {
+      setStatus('Eigenes Baumsymbol geladen. Zu gross zum Speichern, es gilt bis zum Neuladen der Seite.');
+    }
+    setCustomTreeImage(data, true);
+  };
+  rd.readAsDataURL(file);
+});
+$('treeMultiply').addEventListener('change', e => { customTree.multiply = e.target.checked; buildTreePicker(); renderPreview(); });
+$('treeRotate').addEventListener('change', e => { customTree.rotate = e.target.checked; renderPreview(); });
+try {
+  const saved = localStorage.getItem(CUSTOM_KEY);
+  if (saved) setCustomTreeImage(saved, false);
+} catch (e) { /* kein Speicher verfügbar */ }
 ui.style.addEventListener('change', () => { applyStylePreset(); renderPreview(); });
 [ui.optRoof, ui.optShadow, ui.optTexture, ui.optTerrain, ui.optGround, ui.treeSize].forEach(el => el.addEventListener('change', renderPreview));
 ui.treeVar.addEventListener('input', () => { clearTimeout(ui.treeVar._t); ui.treeVar._t = setTimeout(renderPreview, 120); });
@@ -1314,8 +1392,267 @@ function treeGeom(style, r, seed) {
   return g;
 }
 
-// Zeichnen. r in Metern, pxPerM für die Umrechnung, mm für Strichstärken auf Papier
+/* ---------- Weitere Symbole: handgezeichnet, gemalt, eigenes Bild ---------- */
+
+const EXTRA_TREES = [
+  { id: 'hand_sickle', label: 'Sichel' },
+  { id: 'hand_loops', label: 'Schlaufen' },
+  { id: 'hand_wavy', label: 'Wellig' },
+  { id: 'hand_plates', label: 'Platten' },
+  { id: 'hand_leaves', label: 'Blätter' },
+  { id: 'paint', label: 'Gemalt' },
+  { id: 'custom', label: 'Eigenes' }
+];
+const customTree = { img: null, multiply: true, rotate: true };
+const spriteCache = new Map();
+
+// Handgezeichnete Symbole als Linien in Metern relativ zum Stamm (y nach Norden).
+// Schattenseite folgt der gewählten Sonnenrichtung.
+function handGeom(style, r, seed, sun) {
+  const rnd = mulberry32(seed + 29);
+  const s = Math.atan2(sun.shadow[1], sun.shadow[0]);
+  const P = (a, d) => [Math.cos(a) * d, Math.sin(a) * d];
+  const shadeAt = a => Math.max(0, Math.cos(a - s));
+  const g = { r, circle: 0, outline: null, lines: [], rings: [], fills: [], cross: 0, heavy: false };
+
+  if (style === 'hand_sickle') {
+    g.circle = r; g.heavy = true; g.cross = r * 0.08;
+    const N = 40, pts = [];
+    for (let i = 0; i <= N; i++) pts.push(P(s - Math.PI / 2 + Math.PI * i / N, r));
+    for (let i = N; i >= 0; i--) {
+      const a = s - Math.PI / 2 + Math.PI * i / N;
+      pts.push(P(a, r - r * 0.17 * Math.pow(Math.max(0, Math.cos(a - s)), 1.3)));
+    }
+    pts.push(pts[0]);
+    g.fills.push(pts);
+  } else if (style === 'hand_loops') {
+    const loop = (c, ang, rho) => {
+      const pts = [];
+      for (let k = 0; k <= 7; k++) {
+        const u = -Math.PI / 2 + Math.PI * k / 7;
+        const rad = Math.cos(u) * rho * 1.3, tan = Math.sin(u) * rho;
+        pts.push([c[0] + Math.cos(ang) * rad - Math.sin(ang) * tan, c[1] + Math.sin(ang) * rad + Math.cos(ang) * tan]);
+      }
+      g.lines.push(pts);
+    };
+    const rho0 = r * 0.07;
+    const m = Math.round(2 * Math.PI * 0.9 / (0.07 * 2.4));
+    for (let k = 0; k < m; k++) {
+      const a = k / m * Math.PI * 2 + (rnd() - 0.5) * 0.06;
+      if (rnd() < 0.3 + 0.7 * shadeAt(a)) loop(P(a, r * 0.88), a, rho0 * (0.8 + rnd() * 0.4));
+    }
+    const n = 70;
+    for (let i = 0; i < n; i++) {
+      const a = rnd() * Math.PI * 2, d = r * (0.2 + 0.6 * Math.sqrt(rnd()));
+      if (rnd() < 0.12 + 0.6 * shadeAt(a) * (d / r)) loop(P(a, d), a + (rnd() - 0.5) * 0.6, rho0 * (0.7 + rnd() * 0.4));
+    }
+  } else if (style === 'hand_wavy') {
+    const ph = [rnd() * 6.3, rnd() * 6.3, rnd() * 6.3, rnd() * 6.3];
+    const N = 240, pts = [];
+    for (let i = 0; i <= N; i++) {
+      const a = i / N * Math.PI * 2;
+      pts.push(P(a, r * (0.93 + 0.03 * Math.sin(5 * a + ph[0]) + 0.022 * Math.sin(23 * a + ph[1]) +
+        0.014 * Math.sin(41 * a + ph[2]) + 0.01 * (rnd() - 0.5))));
+    }
+    // Umriss mit zwei, drei kleinen Lücken
+    const gaps = new Set();
+    for (let k = 0; k < 2 + Math.floor(rnd() * 2); k++) {
+      const c0 = Math.floor(rnd() * N);
+      for (let j = 0; j < 4; j++) gaps.add((c0 + j) % N);
+    }
+    let seg = [];
+    for (let i = 0; i <= N; i++) {
+      if (gaps.has(i)) { if (seg.length > 1) g.lines.push(seg); seg = []; } else seg.push(pts[i]);
+    }
+    if (seg.length > 1) g.lines.push(seg);
+    // zweite, innere Linie auf der Schattenseite
+    const inner = [];
+    for (let i = 0; i <= 40; i++) {
+      const a = s - 0.9 + 1.8 * i / 40;
+      inner.push(P(a, r * (0.85 + 0.02 * Math.sin(29 * a + ph[3]) + 0.01 * (rnd() - 0.5))));
+    }
+    g.lines.push(inner);
+    // kleine abgelöste Flecken am Rand
+    for (let k = 0; k < 3; k++) {
+      const a = rnd() * Math.PI * 2, c = P(a, r * (1.0 + rnd() * 0.05)), q = r * 0.025;
+      const ring = Array.from({ length: 9 }, (_, i) => [c[0] + Math.cos(i / 8 * Math.PI * 2) * q * (0.8 + rnd() * 0.4), c[1] + Math.sin(i / 8 * Math.PI * 2) * q]);
+      ring[8] = ring[0];
+      g.rings.push(ring);
+    }
+    g.cross = r * 0.07;
+  } else if (style === 'hand_plates') {
+    g.outline = lobedOutline(r, rnd, 0.5);
+    const nm = 5 + Math.floor(rnd() * 3), ph = rnd() * Math.PI * 2, mains = [];
+    for (let k = 0; k < nm; k++) {
+      let ang = ph + k * Math.PI * 2 / nm + (rnd() - 0.5) * 0.5;
+      let p = [0, 0];
+      const pts = [p];
+      for (let st = 0; st < 6; st++) {
+        ang += (rnd() - 0.5) * 0.7;
+        p = [p[0] + Math.cos(ang) * r * 0.16, p[1] + Math.sin(ang) * r * 0.16];
+        const d = Math.hypot(p[0], p[1]);
+        if (d > r * 0.86) { p = [p[0] / d * r * 0.9, p[1] / d * r * 0.9]; pts.push(p); break; }
+        pts.push(p);
+      }
+      mains.push(pts);
+      g.lines.push(pts);
+    }
+    for (let k = 0; k < nm; k++) {
+      const A = mains[k], B = mains[(k + 1) % nm];
+      if (rnd() > 0.75 || A.length < 3 || B.length < 3) continue;
+      const pa = A[Math.min(A.length - 1, 2 + Math.floor(rnd() * 3))], pb = B[Math.min(B.length - 1, 2 + Math.floor(rnd() * 3))];
+      const q = [(pa[0] + pb[0]) / 2 + (rnd() - 0.5) * r * 0.12, (pa[1] + pb[1]) / 2 + (rnd() - 0.5) * r * 0.12];
+      g.lines.push([pa, q, pb]);
+    }
+  } else if (style === 'hand_leaves') {
+    for (let i = 0; i < 260; i++) {
+      const a = rnd() * Math.PI * 2, d = r * 0.94 * Math.sqrt(rnd());
+      if (rnd() > 0.12 + 0.6 * shadeAt(a) + 0.35 * (d / r) ** 2) continue;
+      const L = r * (0.05 + rnd() * 0.035), Wd = L * 0.45, o = rnd() * Math.PI;
+      const c = P(a, d);
+      const ring = [];
+      for (let k = 0; k <= 10; k++) {
+        const t = k / 10 * Math.PI * 2;
+        const lx = Math.cos(t) * L, ly = Math.sin(t) * Wd * (1 - 0.35 * Math.cos(t));
+        ring.push([c[0] + lx * Math.cos(o) - ly * Math.sin(o), c[1] + lx * Math.sin(o) + ly * Math.cos(o)]);
+      }
+      ring[10] = ring[0];
+      g.rings.push(ring);
+    }
+  }
+  return g;
+}
+
+function drawHandTree(c, g, x, y, pxPerM, mm) {
+  const T = p => [x + p[0] * pxPerM, y - p[1] * pxPerM];
+  const path = (pts, close) => {
+    c.beginPath();
+    pts.forEach((p, i) => { const [px, py] = T(p); i ? c.lineTo(px, py) : c.moveTo(px, py); });
+    if (close) c.closePath();
+  };
+  c.save();
+  c.lineCap = 'round'; c.lineJoin = 'round';
+  // helle Unterlage, damit das Symbol auch auf Belag lesbar bleibt
+  c.beginPath(); c.arc(x, y, g.r * 0.96 * pxPerM, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255,255,255,0.5)'; c.fill();
+  c.fillStyle = '#1b1b1a';
+  for (const f of g.fills) { path(f, true); c.fill(); }
+  c.strokeStyle = '#1b1b1a';
+  if (g.circle) {
+    c.beginPath(); c.arc(x, y, g.circle * pxPerM, 0, Math.PI * 2);
+    c.lineWidth = mm(g.heavy ? 0.18 : 0.13); c.stroke();
+  }
+  if (g.outline) { path(g.outline, true); c.lineWidth = mm(0.13); c.stroke(); }
+  c.lineWidth = mm(0.1);
+  for (const l of g.lines) { path(l, false); c.stroke(); }
+  c.lineWidth = mm(0.08);
+  for (const ring of g.rings) { path(ring, true); c.stroke(); }
+  if (g.cross) {
+    const k = g.cross * pxPerM;
+    c.lineWidth = mm(0.12);
+    c.beginPath(); c.moveTo(x - k, y); c.lineTo(x + k, y); c.moveTo(x, y - k); c.lineTo(x, y + k); c.stroke();
+  }
+  c.restore();
+}
+
+// Gemalte Krone: übereinanderliegende, ausgefranste Büschel in Olivtönen, Lichtseite heller,
+// dazu Lücken wie bei einem trockenen Pinsel
+function paintPainterly(c, cx, cy, R, rnd, lx, ly) {
+  const pal = [[68, 92, 48], [96, 122, 64], [130, 154, 86], [170, 190, 122], [206, 220, 160]];
+  const clump = (px, py, rad, col, alpha) => {
+    const n = 56;
+    c.beginPath();
+    for (let i = 0; i <= n; i++) {
+      const a = i / n * Math.PI * 2;
+      const k = rad * (0.7 + 0.32 * rnd());
+      const x = px + Math.cos(a) * k, y = py + Math.sin(a) * k;
+      i ? c.lineTo(x, y) : c.moveTo(x, y);
+    }
+    c.closePath();
+    c.fillStyle = rgba(col, alpha);
+    c.fill();
+  };
+  const place = (maxD, bias) => {
+    const a = rnd() * Math.PI * 2, d = maxD * Math.sqrt(rnd());
+    return [cx + Math.cos(a) * d + lx * R * bias, cy + Math.sin(a) * d + ly * R * bias];
+  };
+  for (let k = 0; k < 11; k++) { const [px, py] = place(R * 0.55, -0.12); clump(px, py, R * (0.3 + rnd() * 0.15), pal[rnd() < 0.6 ? 0 : 1], 0.92); }
+  for (let k = 0; k < 15; k++) { const [px, py] = place(R * 0.62, 0.06); clump(px, py, R * (0.18 + rnd() * 0.14), pal[rnd() < 0.5 ? 1 : 2], 0.85); }
+  for (let k = 0; k < 13; k++) { const [px, py] = place(R * 0.5, 0.2); clump(px, py, R * (0.1 + rnd() * 0.12), pal[3], 0.85); }
+  for (let k = 0; k < 12; k++) { const [px, py] = place(R * 0.45, 0.28); clump(px, py, R * (0.04 + rnd() * 0.06), pal[4], 0.9); }
+  // dunkle Tiefen zwischen den Büscheln
+  const m = Math.min(500, Math.round(R * R * 0.15));
+  for (let i = 0; i < m; i++) {
+    const [px, py] = place(R * 0.8, -0.05);
+    c.fillStyle = rgba(pal[0], 0.55);
+    const sz = Math.max(0.8, R * (0.012 + rnd() * 0.02));
+    c.fillRect(px, py, sz, sz * (0.6 + rnd()));
+  }
+  // Trockenpinsel-Lücken, zum Rand hin häufiger
+  c.globalCompositeOperation = 'destination-out';
+  const holes = Math.min(1200, Math.round(R * R * 0.4));
+  for (let i = 0; i < holes; i++) {
+    const a = rnd() * Math.PI * 2, d = R * 1.02 * Math.sqrt(rnd());
+    if (rnd() > 0.08 + 0.9 * (d / R) ** 3) continue;
+    const sz = Math.max(0.8, R * (0.01 + rnd() * 0.025));
+    c.fillStyle = `rgba(0,0,0,${0.5 + rnd() * 0.5})`;
+    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz * (0.6 + rnd() * 0.8));
+  }
+  c.globalCompositeOperation = 'source-over';
+}
+
+function paintedSprite(rpx, variant, sun) {
+  const rb = Math.max(6, Math.round(rpx / 3) * 3);
+  const key = `paint|${rb}|${variant}|${sun.toSun.join()}`;
+  let sp = spriteCache.get(key);
+  if (sp) return sp;
+  if (spriteCache.size > 300) spriteCache.clear();
+  const pad = Math.ceil(rb * 0.12) + 2, S = 2 * (rb + pad);
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  paintPainterly(cv.getContext('2d'), S / 2, S / 2, rb, mulberry32(variant * 7919 + rb * 31), sun.toSun[0], -sun.toSun[1]);
+  sp = { canvas: cv, scale: rpx / rb };
+  spriteCache.set(key, sp);
+  return sp;
+}
+
+function drawCustomTree(c, x, y, R, seed, mm) {
+  const im = customTree.img;
+  if (!im) {
+    c.save();
+    c.setLineDash([mm(0.8), mm(0.6)]);
+    c.strokeStyle = '#888'; c.lineWidth = mm(0.12);
+    c.beginPath(); c.arc(x, y, R, 0, Math.PI * 2); c.stroke();
+    c.setLineDash([]);
+    c.beginPath(); c.moveTo(x - R * 0.3, y); c.lineTo(x + R * 0.3, y); c.moveTo(x, y - R * 0.3); c.lineTo(x, y + R * 0.3); c.stroke();
+    c.restore();
+    return;
+  }
+  const w = im.naturalWidth || 300, h = im.naturalHeight || 300;
+  const k = 2 * R / Math.max(w, h);
+  c.save();
+  if (customTree.multiply) c.globalCompositeOperation = 'multiply';
+  c.translate(x, y);
+  if (customTree.rotate) c.rotate((seed % 360) * Math.PI / 180);
+  c.drawImage(im, -w * k / 2, -h * k / 2, w * k, h * k);
+  c.restore();
+}
+
+// Verteiler für alle Baumstile
 function drawTree(c, style, x, y, r, seed, pxPerM, mm, sun) {
+  if (style.startsWith('hand_')) return drawHandTree(c, handGeom(style, r, seed, sun), x, y, pxPerM, mm);
+  if (style === 'custom') return drawCustomTree(c, x, y, r * pxPerM, seed, mm);
+  if (style === 'paint') {
+    const sp = paintedSprite(r * pxPerM, seed % 4, sun);
+    const S = sp.canvas.width * sp.scale;
+    c.drawImage(sp.canvas, x - S / 2, y - S / 2, S, S);
+    return;
+  }
+  return drawFamilyTree(c, style, x, y, r, seed, pxPerM, mm, sun);
+}
+
+// Zeichnen der Familien Flach/Grau/Kreis. r in Metern, pxPerM für die Umrechnung, mm für Strichstärken
+function drawFamilyTree(c, style, x, y, r, seed, pxPerM, mm, sun) {
   const g = treeGeom(style, r, seed);
   const R = r * pxPerM;
   const lx = sun.toSun[0], ly = -sun.toSun[1];
@@ -1474,6 +1811,48 @@ function stipple(c, plan, pxPerM, mm, kind) {
     }
   }
   c.stroke();
+}
+
+// Waldsignatur: dichtes Kronendach aus vielen kleinen Kronen mit Schlagschatten.
+// Lage an Weltkoordinaten gebunden, damit Vorschau und Export übereinstimmen.
+function forestCanopy(c, plan, pxPerM, mm, sun) {
+  const [minE, minN, maxE, maxN] = plan.bbox;
+  let step = Math.max(4.5, 2.4 * plan.scale / 1000);
+  while (((maxE - minE) / step) * ((maxN - minN) / step) > 60000) step *= 1.2;
+  const X = e => (e - minE) * pxPerM, Y = n => (maxN - n) * pxPerM;
+  const crowns = [];
+  const i0 = Math.floor(minE / step) - 1, i1 = Math.ceil(maxE / step) + 1;
+  const j0 = Math.floor(minN / step) - 1, j1 = Math.ceil(maxN / step) + 1;
+  for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+    crowns.push({
+      e: (i + 0.1 + 0.8 * hash2(i, j, 31)) * step,
+      n: (j + 0.1 + 0.8 * hash2(i, j, 32)) * step,
+      r: step * (0.5 + 0.28 * hash2(i, j, 33)),
+      t: hash2(i, j, 34)
+    });
+  }
+  crowns.sort((a, b) => a.t - b.t);
+  const [sx, sy] = sun.shadow, [lx, ly] = sun.toSun;
+  // Schatten als eine Fläche, damit Überlappungen nicht doppelt dunkeln
+  c.fillStyle = 'rgba(36,56,32,0.24)';
+  c.beginPath();
+  for (const k of crowns) {
+    const off = k.r * 0.45, cx = X(k.e + sx * off), cy = Y(k.n + sy * off), R = k.r * pxPerM;
+    c.moveTo(cx + R, cy); c.arc(cx, cy, R, 0, Math.PI * 2);
+  }
+  c.fill();
+  c.lineWidth = Math.max(0.5, mm(0.07));
+  c.strokeStyle = 'rgba(74,104,64,0.75)';
+  for (const k of crowns) {
+    const cx = X(k.e), cy = Y(k.n), R = k.r * pxPerM;
+    const col = mix([150, 176, 128], [184, 204, 156], k.t);
+    c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2);
+    c.fillStyle = `rgb(${col[0]},${col[1]},${col[2]})`;
+    c.fill(); c.stroke();
+    c.beginPath(); c.arc(cx + lx * R * 0.28, cy - ly * R * 0.28, R * 0.5, 0, Math.PI * 2);
+    c.fillStyle = 'rgba(250,252,236,0.2)';
+    c.fill();
+  }
 }
 
 // Höhengitter aus dem swisstopo-Höhenmodell über den Profil-Dienst: eine Linie pro Zeile
@@ -1636,11 +2015,52 @@ function drawPlan(canvas, plan, dpi, o) {
 
   const greens = kind => plan.green.filter(g => g.kind === kind).map(g => g.poly);
 
-  // Wasser
-  fillStroke(ctx, greens('water'), COL.water, COL.waterEdge, mm(0.15));
+  // Hilfsebene für Linien in festem Abstand innerhalb einer Fläche (Uferlinien)
+  let scratch = null;
+  const innerLine = (c, polys, dist, lw, color) => {
+    if (!scratch) { scratch = document.createElement('canvas'); scratch.width = W; scratch.height = H; }
+    const t = scratch.getContext('2d');
+    t.globalCompositeOperation = 'source-over';
+    t.clearRect(0, 0, W, H);
+    t.lineJoin = 'round';
+    t.beginPath(); polys.forEach(p => tracePoly(t, p));
+    t.strokeStyle = color; t.lineWidth = 2 * dist + lw; t.stroke();
+    t.globalCompositeOperation = 'destination-out';
+    t.strokeStyle = '#000'; t.lineWidth = Math.max(0, 2 * dist - lw); t.stroke();
+    t.globalCompositeOperation = 'destination-in';
+    t.fillStyle = '#000'; t.fill('evenodd');
+    t.globalCompositeOperation = 'source-over';
+    c.drawImage(scratch, 0, 0);
+  };
+
+  // Wasser: zur Mitte dunkler (Tiefe), heller Uferstreifen, feine Uferlinien
+  const water = greens('water');
+  if (water.length) {
+    composite(c => {
+      fillStroke(c, water, COL.waterDeep, null, 0);
+      c.save();
+      c.beginPath(); water.forEach(p => tracePoly(c, p)); c.clip('evenodd');
+      c.strokeStyle = 'rgba(238,245,250,0.16)';
+      for (let k = 9; k >= 1; k--) {
+        c.lineWidth = 2 * k * mm(0.8);
+        c.beginPath(); water.forEach(p => tracePoly(c, p)); c.stroke();
+      }
+      c.restore();
+      if (o.detail) {
+        innerLine(c, water, mm(1.1), mm(0.09), 'rgba(92,136,168,0.6)');
+        innerLine(c, water, mm(2.4), mm(0.08), 'rgba(92,136,168,0.4)');
+      }
+      fillStroke(c, water, null, COL.waterEdge, mm(0.18));
+    });
+  }
 
   // Wiese und Wald: Geländeschattierung und Punktsignatur nur auf den Grünflächen
   const greenTex = kind => (o.texture || (o.terrain && plan.terrain)) ? c => {
+    if (kind === 'forest') {
+      if (o.texture) forestCanopy(c, plan, pxPerM, mm, sun);
+      if (o.terrain) terrainShade(c, plan, pxPerM, sun);
+      return;
+    }
     if (o.terrain) terrainShade(c, plan, pxPerM, sun);
     if (o.texture) stipple(c, plan, pxPerM, mm, kind);
   } : null;
@@ -1940,7 +2360,7 @@ ui.btnPng.addEventListener('click', () => {
   }
   const c = document.createElement('canvas');
   drawPlan(c, plan, dpi, renderOpts());
-  c.toBlob(blob => download(blob, fileBase() + '.png'), 'image/png');
+  c.toBlob(blob => { download(blob, fileBase() + '.png'); askForSupport(); }, 'image/png');
 });
 
 ui.btnDxf.addEventListener('click', async () => {
@@ -1952,6 +2372,7 @@ ui.btnDxf.addEventListener('click', async () => {
     const dxf = await buildDXF(state.plan, renderOpts());
     download(new Blob([dxf], { type: 'application/dxf' }), fileBase() + '.dxf');
     progress.done('DXF erzeugt');
+    askForSupport();
     setStatus('DXF erzeugt.');
   } catch (err) {
     console.error(err);
@@ -2039,9 +2460,10 @@ async function buildDXF(plan, o) {
     ['RAHMEN', 7], ['GEBAEUDE', 7], ['GEBAEUDE_FUELLUNG', 7], ['GEBAEUDE_FASSADE', 8, 'DASHED'],
     ['DACH', 8], ['DACH_UMRISS', 7], ['LAUBEN', 8, 'DASHED'],
     ['SCHATTEN', 9], ['SCHATTEN_FUELLUNG', 254],
-    ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9], ['BAHN', 8], ['STRASSENNAMEN', 7],
+    ['STRASSE_RAND', 8], ['TROTTOIRKANTE', 9], ['MARKIERUNG', 9, 'MARKIERUNG'], ['FUSSGAENGERSTREIFEN', 9],
+    ['BAHN', 8], ['STRASSENNAMEN', 7],
     ['GRUEN', 3], ['WALD', 94], ['WASSER', 5], ['BAEUME', 94],
-    ['BAEUME_KRONE_GESTRICHELT', 94, 'DASHED'], ['BAEUME_AESTE', 94], ['BAEUME_STAMM', 7],
+    ['BAEUME_KRONE_GESTRICHELT', 94, 'DASHED'], ['BAEUME_AESTE', 94], ['BAEUME_STAMM', 7], ['BAEUME_FUELLUNG', 7],
     ['PARZELLEN', 7], ['PARZELLEN_NR', 7]
   ];
   const dash = 1.2 * plan.scale / 1000, gap = 0.8 * plan.scale / 1000;
@@ -2054,10 +2476,12 @@ async function buildDXF(plan, o) {
   g(0, 'ENDSEC');
 
   g(0, 'SECTION'); g(2, 'TABLES');
-  g(0, 'TABLE'); g(2, 'LTYPE'); g(70, 2);
+  g(0, 'TABLE'); g(2, 'LTYPE'); g(70, 3);
   g(0, 'LTYPE'); g(2, 'CONTINUOUS'); g(70, 0); g(3, 'Solid line'); g(72, 65); g(73, 0); g(40, '0.0');
   g(0, 'LTYPE'); g(2, 'DASHED'); g(70, 0); g(3, 'Dashed'); g(72, 65); g(73, 2);
   g(40, f(dash + gap)); g(49, f(dash)); g(49, f(-gap));
+  g(0, 'LTYPE'); g(2, 'MARKIERUNG'); g(70, 0); g(3, 'Leitlinie 3 m / 6 m'); g(72, 65); g(73, 2);
+  g(40, '9.0'); g(49, '3.0'); g(49, '-6.0');
   g(0, 'ENDTAB');
   g(0, 'TABLE'); g(2, 'LAYER'); g(70, layers.length);
   for (const [name, color, lt] of layers) {
@@ -2127,6 +2551,23 @@ async function buildDXF(plan, o) {
     for (const p of roads.outer) p.forEach(r => pline('STRASSE_RAND', r));
     for (const p of roads.inner) p.forEach(r => pline('TROTTOIRKANTE', r));
   }
+  if (o.detail) {
+    for (const l of plan.roadLines) {
+      if ((l.kind === 'major' || l.kind === 'minor') && !l.oneway && (l.innerW || l.outerW) >= 6) {
+        for (const part of clipLine(l.lv, bbox)) plineOpen('MARKIERUNG', part);
+      }
+    }
+    for (const z of plan.zebras) {
+      if (z.e < minE || z.e > maxE || z.n < minN || z.n > maxN) continue;
+      const nx = -z.dy, ny = z.dx;
+      for (let t = -z.w / 2 + 0.25; t <= z.w / 2 - 0.25; t += 1.0) {
+        const cx = z.e + nx * t, cy = z.n + ny * t;
+        const ring = [[2, 0.25], [2, -0.25], [-2, -0.25], [-2, 0.25], [2, 0.25]]
+          .map(([u, v]) => [cx + z.dx * u + nx * v, cy + z.dy * u + ny * v]);
+        pline('FUSSGAENGERSTREIFEN', ring);
+      }
+    }
+  }
 
   for (const r of plan.rails) {
     for (const sgn of [-0.72, 0.72]) for (const part of clipLine(offsetPolyline(r.lv, sgn), bbox)) plineOpen('BAHN', part);
@@ -2177,9 +2618,27 @@ async function buildDXF(plan, o) {
   for (const t of plan.trees) {
     if (t.e < minE || t.e > maxE || t.n < minN || t.n > maxN) continue;
     const r = treeDiameter(t, o) / 2;
+    const at = pts => pts.map(([x, y]) => [t.e + x, t.n + y]);
+    if (treeStyle.startsWith('hand_')) {
+      const hg = handGeom(treeStyle, r, t.seed, sun);
+      if (hg.circle) { g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(hg.circle)); }
+      if (hg.outline) pline('BAEUME', at(hg.outline));
+      for (const l of hg.lines) plineOpen('BAEUME', at(l));
+      for (const ring of hg.rings) pline('BAEUME', at(ring));
+      for (const fl of hg.fills) { pline('BAEUME_FUELLUNG', at(fl)); solids('BAEUME_FUELLUNG', [at(fl)]); }
+      if (hg.cross) {
+        line('BAEUME', [t.e - hg.cross, t.n], [t.e + hg.cross, t.n]);
+        line('BAEUME', [t.e, t.n - hg.cross], [t.e, t.n + hg.cross]);
+      }
+      continue;
+    }
+    if (treeStyle === 'paint' || treeStyle === 'custom') {
+      g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r));
+      g(0, 'POINT'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0');
+      continue;
+    }
     const gm = treeGeom(treeStyle, r, t.seed);
     const crownLayer = gm.dashed ? 'BAEUME_KRONE_GESTRICHELT' : 'BAEUME';
-    const at = pts => pts.map(([x, y]) => [t.e + x, t.n + y]);
     if (gm.outline) pline(crownLayer, at(gm.outline));
     else { g(0, 'CIRCLE'); g(8, crownLayer); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r)); }
     for (const ring of gm.inner) pline('BAEUME', at(ring));
@@ -2436,6 +2895,59 @@ ui.btnCloud = $('btnCloud');
 ui.btnBldg3d = $('btnBldg3d');
 ui.btnCloud.addEventListener('click', () => search3d('cloud'));
 ui.btnBldg3d.addEventListener('click', () => search3d('bldg'));
+
+/* =========================================================
+   Freiwilliger Beitrag: Fenster nach dem Download, höchstens einmal pro Sitzung
+   ========================================================= */
+const donateDlg = $('donate');
+const donateConfigured = DONATE.paypalMe && DONATE.paypalMe !== 'DEIN-PAYPAL-NAME';
+
+(function buildDonate() {
+  const box = $('donateAmounts');
+  for (const amt of DONATE.amounts) {
+    const a = document.createElement('a');
+    a.textContent = `${amt} ${DONATE.currency === 'EUR' ? '€' : DONATE.currency}`;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.href = donateConfigured
+      ? `https://www.paypal.me/${encodeURIComponent(DONATE.paypalMe)}/${amt}${DONATE.currency}`
+      : '#';
+    a.addEventListener('click', ev => {
+      if (!donateConfigured) {
+        ev.preventDefault();
+        const note = $('donateNote');
+        note.hidden = false;
+        note.textContent = 'Der PayPal-Link ist noch nicht eingerichtet (DONATE.paypalMe in app.js).';
+        return;
+      }
+      try { sessionStorage.setItem('lageplan.donated', '1'); } catch (e) { /* egal */ }
+      setTimeout(() => donateDlg.close(), 300);
+    });
+    box.appendChild(a);
+  }
+})();
+
+function showDonate() {
+  if (typeof donateDlg.showModal === 'function') donateDlg.showModal();
+  else donateDlg.setAttribute('open', '');
+}
+
+function askForSupport() {
+  try {
+    if (localStorage.getItem('lageplan.noDonate') === '1') return;
+    if (sessionStorage.getItem('lageplan.asked') === '1') return;
+    sessionStorage.setItem('lageplan.asked', '1');
+  } catch (e) { /* ohne Speicher trotzdem fragen */ }
+  setTimeout(showDonate, 600); // erst nach dem Start des Downloads
+}
+
+$('donateNever').addEventListener('change', e => {
+  try {
+    if (e.target.checked) localStorage.setItem('lageplan.noDonate', '1');
+    else localStorage.removeItem('lageplan.noDonate');
+  } catch (err) { /* egal */ }
+});
+$('btnSupport').addEventListener('click', showDonate);
 
 buildTreePicker();
 applyStylePreset();

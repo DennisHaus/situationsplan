@@ -78,6 +78,13 @@
         <fieldset class="treepick">
           <legend>Bäume</legend>
           <div id="treeStyles" class="tree-grid" role="radiogroup" aria-label="Baumdarstellung"></div>
+          <div id="treeExtra" class="tree-extra" role="radiogroup" aria-label="Weitere Baumsymbole"></div>
+          <div class="custom-tree">
+            <input id="treeFile" type="file" accept="image/png,image/jpeg,image/webp,image/svg+xml" hidden>
+            <button id="treeUpload" type="button">Eigenes Symbol laden …</button>
+            <label class="chk"><input type="checkbox" id="treeMultiply" checked> Weiss ausblenden</label>
+            <label class="chk"><input type="checkbox" id="treeRotate" checked> Zufällig drehen</label>
+          </div>
           <div class="row2">
             <label>Kronen-Ø ohne Angabe (m)<input id="treeSize" type="number" min="2" max="20" step="0.5" value="7"></label>
             <label>Grössenvariation<input id="treeVar" type="range" min="0" max="100" value="60"></label>
@@ -117,6 +124,8 @@
         <div id="dl3d" class="dl3d" hidden></div>
       </section>
 
+      <button id="btnSupport" type="button" class="support-link">Plattform unterstützen</button>
+
       <footer class="credits">
         Daten: © swisstopo, © OpenStreetMap-Mitwirkende (ODbL). Parzellen aus der amtlichen Vermessung, ohne Rechtsgültigkeit.
       </footer>
@@ -139,6 +148,17 @@
       </div>
     </main>
   </div>
+
+  <dialog id="donate" class="donate" aria-labelledby="donateTitle">
+    <form method="dialog">
+      <h2 id="donateTitle">Gefällt dir der Lageplan?</h2>
+      <p>Das Tool ist kostenlos. Mit einem freiwilligen Beitrag hilfst du, die Plattform zu unterhalten und weiterzuentwickeln.</p>
+      <div class="donate-amounts" id="donateAmounts"></div>
+      <p id="donateNote" class="hint" hidden></p>
+      <label class="chk"><input type="checkbox" id="donateNever"> Nicht mehr fragen</label>
+      <button value="close" class="donate-close">Vielleicht später</button>
+    </form>
+  </dialog>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/proj4@2.11.0/dist/proj4.js"></script>
