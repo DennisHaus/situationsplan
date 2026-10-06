@@ -97,6 +97,16 @@
         <p id="status" class="status" role="status" aria-live="polite"></p>
       </section>
 
+      <section class="group">
+        <h2>3D-Daten von swisstopo</h2>
+        <p class="hint">Originaldaten, die den Ausschnitt abdecken. Die Punktwolke kommt in Kacheln zu 1 × 1 km, die Gebäude in Kartenblättern.</p>
+        <div class="downloads">
+          <button id="btnCloud">Punktwolke suchen</button>
+          <button id="btnBldg3d">3D-Gebäude suchen</button>
+        </div>
+        <div id="dl3d" class="dl3d" hidden></div>
+      </section>
+
       <footer class="credits">
         Daten: © swisstopo, © OpenStreetMap-Mitwirkende (ODbL). Parzellen aus der amtlichen Vermessung, ohne Rechtsgültigkeit.
       </footer>
@@ -108,6 +118,11 @@
         <button id="tabPlan" role="tab" aria-selected="false">Plan</button>
       </div>
       <div id="map" class="view"></div>
+      <div id="progress" class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+        <div class="progress-head"><span id="progLabel">Lade Daten</span><span id="progPct">0 %</span></div>
+        <div class="progress-track"><div id="progBar" class="progress-bar"></div></div>
+        <p id="progDetail" class="progress-detail"></p>
+      </div>
       <div id="planView" class="view plan" hidden>
         <p id="planEmpty" class="empty">Noch kein Plan. Ausschnitt wählen und «Plan erzeugen» klicken.</p>
         <canvas id="preview" hidden></canvas>

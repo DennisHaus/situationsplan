@@ -187,7 +187,7 @@ ui.tabPlan.addEventListener('click', () => showTab('plan'));
    Daten holen
    ========================================================= */
 
-async function fetchOverpass([s, w, n, e]) {
+async function fetchOverpass([s, w, n, e], hooks = {}) {
   const b = `(${s},${w},${n},${e})`;
   const q = `[out:json][timeout:90];
 (
@@ -216,16 +216,38 @@ out geom;`;
         body: 'data=' + encodeURIComponent(q)
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return await r.json();
+      return await readJsonWithProgress(r, hooks);
     } catch (err) {
       lastErr = err;
+      if (hooks.onRetry) hooks.onRetry();
     }
   }
   throw new Error('OpenStreetMap-Server nicht erreichbar (' + (lastErr && lastErr.message) + ')');
 }
 
+// Antwort stückweise lesen, damit die empfangene Datenmenge angezeigt werden kann
+async function readJsonWithProgress(r, hooks) {
+  const total = +r.headers.get('Content-Length') || 0;
+  if (hooks.onHeaders) hooks.onHeaders(total);
+  if (!r.body || !r.body.getReader) return r.json();
+  const reader = r.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (hooks.onBytes) hooks.onBytes(received);
+  }
+  const all = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { all.set(c, off); off += c.length; }
+  return JSON.parse(new TextDecoder().decode(all));
+}
+
 // Parzellen aus der amtlichen Vermessung über die geo.admin.ch Identify-API
-async function fetchParcels(bbox) {
+async function fetchParcels(bbox, onPage) {
   const [a, b, c, d] = bbox.map(v => v.toFixed(1));
   const LIMIT = 50;
   const seen = new Map();
@@ -246,6 +268,7 @@ async function fetchParcels(bbox) {
       const id = f.featureId != null ? f.featureId : (f.id != null ? f.id : JSON.stringify(f.properties));
       if (!seen.has(id)) { seen.set(id, f); added++; }
     }
+    if (onPage) onPage(page + 1);
     if (results.length < LIMIT || added === 0) break;
   }
 
@@ -630,30 +653,62 @@ async function generate() {
 
   ui.btnGenerate.disabled = true;
   ui.btnPng.disabled = ui.btnDxf.disabled = true;
+  progress.start('Lade Daten');
+  let ticker = null;
 
   try {
     const pad = 60;
     const padBox = [bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad];
-    const fetchCorners = [
-      [padBox[0], padBox[1]], [padBox[2], padBox[1]], [padBox[2], padBox[3]], [padBox[0], padBox[3]]
-    ].map(toWGS);
-    const lons = fetchCorners.map(c => c[0]), lats = fetchCorners.map(c => c[1]);
-    const wgsBox = [Math.min(...lats), Math.min(...lons), Math.max(...lats), Math.max(...lons)];
+    const wgsBox = wgsBounds(padBox);
 
     const needOsm = opts.buildings || opts.roads || opts.green || opts.trees;
     const needParcels = opts.parcels || opts.parcelNr;
-    setStatus('Lade Daten von OpenStreetMap und geo.admin.ch …');
+    setStatus('');
+
+    // Ladefortschritt: Overpass sendet keine Gesamtgrösse, daher Schätzung
+    // aus Wartezeit und empfangener Datenmenge
+    const load = { phase: 'wait', t0: performance.now(), received: 0, total: 0, pages: 0, osmDone: !needOsm, parcDone: !needParcels };
+    const areaHa = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / 1e4;
+    const expectedBytes = Math.max(4e5, areaHa * 2.5e5);
+    const tick = () => {
+      let o = 1;
+      if (!load.osmDone) {
+        if (load.phase === 'wait') {
+          o = 0.4 * (1 - Math.exp(-(performance.now() - load.t0) / 12000));
+        } else {
+          o = 0.4 + 0.6 * (load.total ? load.received / load.total : 1 - Math.exp(-load.received / expectedBytes));
+          o = Math.min(o, 0.98);
+        }
+      }
+      const p = load.parcDone ? 1 : Math.min(0.9, 0.15 + load.pages * 0.3);
+      const f = needOsm && needParcels ? 0.8 * o + 0.2 * p : needOsm ? o : p;
+      const detail = !needOsm ? 'Parzellen werden geladen …'
+        : load.osmDone ? 'OpenStreetMap geladen, warte auf Parzellen …'
+        : load.phase === 'wait' ? 'OpenStreetMap stellt die Daten zusammen …'
+        : `${(load.received / 1e6).toFixed(1)} MB von OpenStreetMap empfangen`;
+      progress.set(2 + 58 * f, 'Lade Daten', detail);
+    };
+    ticker = setInterval(tick, 200);
 
     const warnings = [];
     const [osm, parcelsRaw] = await Promise.all([
-      needOsm ? fetchOverpass(wgsBox) : Promise.resolve({ elements: [] }),
+      needOsm
+        ? fetchOverpass(wgsBox, {
+            onHeaders: total => { load.phase = 'bytes'; load.total = total; },
+            onBytes: n => { load.received = n; },
+            onRetry: () => { load.phase = 'wait'; load.received = 0; load.t0 = performance.now(); }
+          }).then(r => { load.osmDone = true; return r; })
+        : Promise.resolve({ elements: [] }),
       needParcels
-        ? fetchParcels(bbox).catch(err => { warnings.push('Parzellen nicht verfügbar (' + err.message + ')'); return []; })
+        ? fetchParcels(bbox, n => { load.pages = n; })
+            .catch(err => { warnings.push('Parzellen nicht verfügbar (' + err.message + ')'); return []; })
+            .then(r => { load.parcDone = true; return r; })
         : Promise.resolve([])
     ]);
+    clearInterval(ticker); ticker = null;
 
-    setStatus('Verarbeite Geometrien …');
-    await nextFrame();
+    progress.set(60, 'Verarbeite Daten', 'Objekte werden sortiert …');
+    await yieldUI();
 
     const data = classify(osm);
     const plan = {
@@ -662,7 +717,13 @@ async function generate() {
     };
 
     if (opts.buildings) {
-      for (const b of data.buildings) {
+      const n = data.buildings.length;
+      for (let i = 0; i < n; i++) {
+        if (i % 40 === 0) {
+          progress.set(62 + 18 * i / n, 'Verarbeite Gebäude', `${i} von ${n}`);
+          await yieldUI();
+        }
+        const b = data.buildings[i];
         const poly = projPoly(b.poly);
         if (!bboxHit(polyBBox(poly), padBox)) continue;
         const area = planarArea(poly);
@@ -671,6 +732,9 @@ async function generate() {
         });
       }
     }
+
+    progress.set(80, 'Verarbeite Grünflächen und Strassen', '');
+    await yieldUI();
 
     if (opts.green) {
       for (const g of data.green) {
@@ -697,6 +761,9 @@ async function generate() {
       }
     }
 
+    progress.set(88, 'Verarbeite Parzellen', '');
+    await yieldUI();
+
     if (needParcels) {
       for (const p of parcelsRaw) {
         const clipped = clipPolys(p.polys, bbox);
@@ -712,21 +779,34 @@ async function generate() {
       }
     }
 
+    progress.set(94, 'Zeichne Plan', '');
+    await yieldUI();
+
     state.plan = plan;
     await document.fonts.ready;
-    renderPreview();
     showTab('plan');
+    renderPreview();
     ui.btnPng.disabled = ui.btnDxf.disabled = false;
+    progress.done('Plan erzeugt');
 
     const summary = `${plan.buildings.length} Gebäude, ${plan.trees.length} Bäume, ` +
       `${plan.roadLines.length} Strassenabschnitte, ${plan.parcels.length} Parzellenflächen.`;
     setStatus(warnings.length ? summary + ' ' + warnings.join(' ') : 'Plan erzeugt: ' + summary, warnings.length > 0);
   } catch (err) {
     console.error(err);
+    progress.fail();
     setStatus('Fehler: ' + err.message, true);
   } finally {
+    if (ticker) clearInterval(ticker);
     ui.btnGenerate.disabled = false;
   }
+}
+
+function wgsBounds([minE, minN, maxE, maxN]) {
+  const c = [[minE, minN], [maxE, minN], [maxE, maxN], [minE, maxN]].map(toWGS);
+  const lons = c.map(p => p[0]), lats = c.map(p => p[1]);
+  // Reihenfolge für Overpass: süd, west, nord, ost
+  return [Math.min(...lats), Math.min(...lons), Math.max(...lats), Math.max(...lons)];
 }
 
 /* =========================================================
@@ -1102,15 +1182,17 @@ ui.btnPng.addEventListener('click', () => {
 
 ui.btnDxf.addEventListener('click', async () => {
   if (!state.plan) return;
-  setStatus('Erzeuge DXF …');
+  setStatus('');
   ui.btnDxf.disabled = true;
-  await nextFrame();
+  progress.start('Erzeuge DXF');
   try {
-    const dxf = buildDXF(state.plan, renderOpts());
+    const dxf = await buildDXF(state.plan, renderOpts());
     download(new Blob([dxf], { type: 'application/dxf' }), fileBase() + '.dxf');
+    progress.done('DXF erzeugt');
     setStatus('DXF erzeugt.');
   } catch (err) {
     console.error(err);
+    progress.fail();
     setStatus('DXF-Fehler: ' + err.message, true);
   } finally {
     ui.btnDxf.disabled = false;
@@ -1119,27 +1201,41 @@ ui.btnDxf.addEventListener('click', async () => {
 
 /* ---------- Flächen für DXF ---------- */
 
-function roadOutlines(plan) {
+async function roadOutlines(plan) {
   const outer = [...plan.roadAreas], inner = [];
+  const n = plan.roadLines.length;
   const buf = (coords, w, target) => {
     try {
       const b = turf.buffer(turf.lineString(coords), w / 2, { units: 'meters', steps: 6 });
       if (b) collectPolys({ type: b.geometry.type, coordinates: projectCoords(b.geometry.coordinates) }, target);
     } catch (e) { /* überspringen */ }
   };
-  for (const l of plan.roadLines) {
+  for (let i = 0; i < n; i++) {
+    if (i % 50 === 0) {
+      progress.set(10 + 30 * i / n, 'Erzeuge DXF', `Strassenflächen ${i} von ${n}`);
+      await yieldUI();
+    }
+    const l = plan.roadLines[i];
     buf(l.wgs, l.outerW, outer);
     if (l.innerW) buf(l.wgs, l.innerW, inner);
   }
-  return {
-    outer: clipPolys(unionAll(outer), plan.bbox),
-    inner: clipPolys(unionAll(inner), plan.bbox)
-  };
+  progress.set(40, 'Erzeuge DXF', 'Strassenränder werden vereinigt …');
+  await yieldUI();
+  const o = clipPolys(unionAll(outer), plan.bbox);
+  progress.set(50, 'Erzeuge DXF', 'Trottoirkanten werden vereinigt …');
+  await yieldUI();
+  return { outer: o, inner: clipPolys(unionAll(inner), plan.bbox) };
 }
 
-function shadowPolys(plan, sun) {
+async function shadowPolys(plan, sun) {
   const all = [];
-  for (const b of plan.buildings) {
+  const n = plan.buildings.length;
+  for (let i = 0; i < n; i++) {
+    if (i % 25 === 0) {
+      progress.set(60 + 25 * i / n, 'Erzeuge DXF', `Schatten ${i} von ${n}`);
+      await yieldUI();
+    }
+    const b = plan.buildings[i];
     const len = b.height * SHADOW_FACTOR;
     const dx = sun.shadow[0] * len, dy = sun.shadow[1] * len;
     const ring = b.poly[0];
@@ -1152,6 +1248,8 @@ function shadowPolys(plan, sun) {
     }
     all.push(...unionAll(parts.map(r => [r])));
   }
+  progress.set(85, 'Erzeuge DXF', 'Schatten werden vereinigt …');
+  await yieldUI();
   return clipPolys(unionAll(all), plan.bbox);
 }
 
@@ -1165,7 +1263,7 @@ function clipSegment(a, b, bbox) {
 }
 
 /* ---------- DXF (R12, ASCII, Koordinaten in LV95 / Meter) ---------- */
-function buildDXF(plan, o) {
+async function buildDXF(plan, o) {
   const out = [];
   const g = (code, val) => out.push(String(code), String(val));
   const f = v => v.toFixed(3);
@@ -1248,7 +1346,7 @@ function buildDXF(plan, o) {
   for (const p of greens('water')) p.forEach(r => pline('WASSER', r));
 
   if (plan.roadLines.length || plan.roadAreas.length) {
-    const roads = roadOutlines(plan);
+    const roads = await roadOutlines(plan);
     for (const p of roads.outer) p.forEach(r => pline('STRASSE_RAND', r));
     for (const p of roads.inner) p.forEach(r => pline('TROTTOIRKANTE', r));
   }
@@ -1256,12 +1354,14 @@ function buildDXF(plan, o) {
   for (const p of plan.parcels) p.forEach(r => pline('PARZELLEN', r));
 
   if (o.shadow && plan.buildings.length) {
-    for (const p of shadowPolys(plan, sun)) {
+    for (const p of await shadowPolys(plan, sun)) {
       p.forEach(r => pline('SCHATTEN', r));
       solids('SCHATTEN_FUELLUNG', p);
     }
   }
 
+  progress.set(90, 'Erzeuge DXF', 'Gebäude und Dächer …');
+  await yieldUI();
   for (const b of plan.buildings) {
     const clipped = clipPolys([b.poly], bbox);
     for (const p of clipped) {
@@ -1299,7 +1399,18 @@ function buildDXF(plan, o) {
 
 /* ---------- Hilfsfunktionen ---------- */
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function nextFrame() { return new Promise(r => requestAnimationFrame(() => r())); }
+// Kurz an den Browser abgeben, damit Fortschritt gezeichnet wird (auch im Hintergrund-Tab)
+function yieldUI() {
+  return new Promise(r => {
+    let done = false;
+    const go = () => { if (!done) { done = true; r(); } };
+    requestAnimationFrame(go);
+    setTimeout(go, 50);
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 function stripTags(s) { return String(s).replace(/<[^>]*>/g, ''); }
 function asciiSafe(s) {
   return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\x20-\x7E]/g, '?');
@@ -1312,6 +1423,193 @@ function mulberry32(a) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
+
+/* =========================================================
+   Fortschrittsanzeige
+   ========================================================= */
+const progress = {
+  el: $('progress'), bar: $('progBar'), pct: $('progPct'), label: $('progLabel'), detail: $('progDetail'),
+  value: 0, hideTimer: null,
+  start(label) {
+    clearTimeout(this.hideTimer);
+    this.value = 0;
+    this.el.hidden = false;
+    this.set(0, label, '');
+  },
+  set(v, label, detail) {
+    v = clamp(v, 0, 100);
+    if (v < this.value) v = this.value; // nie rückwärts
+    this.value = v;
+    this.bar.style.width = v + '%';
+    this.pct.textContent = Math.round(v) + ' %';
+    this.el.setAttribute('aria-valuenow', String(Math.round(v)));
+    if (label != null) this.label.textContent = label;
+    if (detail != null) this.detail.textContent = detail;
+  },
+  done(label) {
+    this.set(100, label || 'Fertig', '');
+    this.hideTimer = setTimeout(() => { this.el.hidden = true; }, 900);
+  },
+  fail() { this.el.hidden = true; }
+};
+
+/* =========================================================
+   3D-Daten von swisstopo (STAC API)
+   ========================================================= */
+const STAC = 'https://data.geo.admin.ch/api/stac/v1/collections/';
+const DATASETS = {
+  cloud: { id: 'ch.swisstopo.swisssurface3d', title: 'Punktwolke swissSURFACE3D', unit: 'Kachel', units: 'Kacheln' },
+  bldg: { id: 'ch.swisstopo.swissbuildings3d_3_0', title: '3D-Gebäude swissBUILDINGS3D 3.0', unit: 'Kartenblatt', units: 'Kartenblätter' }
+};
+const dl3d = $('dl3d');
+
+async function stacItems(collection, bboxWgs, onPage) {
+  let url = `${STAC}${collection}/items?bbox=${bboxWgs.join(',')}&limit=100`;
+  const items = [];
+  for (let page = 0; url && page < 30; page++) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    items.push(...(j.features || []));
+    if (onPage) onPage(items.length);
+    const next = (j.links || []).find(l => l.rel === 'next');
+    url = next ? next.href : null;
+  }
+  return items;
+}
+
+// Pro Kachel nur den neusten Jahrgang behalten
+function latestPerTile(items) {
+  const best = new Map();
+  for (const it of items) {
+    const m = /_(\d{4})_([0-9-]+)$/.exec(it.id);
+    const tile = m ? m[2] : it.id, year = m ? +m[1] : 0;
+    const cur = best.get(tile);
+    if (!cur || year > cur.year) best.set(tile, { tile, year, item: it });
+  }
+  return [...best.values()].sort((a, b) => a.tile.localeCompare(b.tile));
+}
+
+function formatOf(href) {
+  const name = href.split('/').pop().toLowerCase();
+  const m = /\.([a-z0-9]+)\.zip$/.exec(name) || /\.([a-z0-9]+)$/.exec(name);
+  return m ? m[1].toUpperCase() : 'Datei';
+}
+
+function fmtBytes(n) {
+  if (!n) return '';
+  if (n > 1e9) return (n / 1e9).toFixed(1) + ' GB';
+  if (n > 1e6) return Math.round(n / 1e6) + ' MB';
+  return Math.round(n / 1e3) + ' kB';
+}
+
+async function search3d(kind) {
+  const ds = DATASETS[kind];
+  const [s, w, n, e] = wgsBounds(getBBox());
+  ui.btnCloud.disabled = ui.btnBldg3d.disabled = true;
+  progress.start('Suche ' + ds.units);
+  progress.set(10, null, 'Frage swisstopo an …');
+  try {
+    const items = await stacItems(ds.id, [w, s, e, n], count => progress.set(30, null, `${count} Einträge gefunden`));
+    progress.set(70, null, 'Wähle den neusten Stand pro ' + ds.unit + ' …');
+    const tiles = latestPerTile(items);
+    const files = [];
+    for (const t of tiles) {
+      for (const [name, a] of Object.entries(t.item.assets || {})) {
+        files.push({ tile: t.tile, year: t.year, name, href: a.href, fmt: formatOf(a.href), size: a['file:size'] || 0 });
+      }
+    }
+    progress.done(`${tiles.length} ${tiles.length === 1 ? ds.unit : ds.units} gefunden`);
+    render3d(kind, tiles.length, files);
+  } catch (err) {
+    console.error(err);
+    progress.fail();
+    dl3d.hidden = false;
+    dl3d.innerHTML = `<p class="status error">Suche fehlgeschlagen: ${escapeHtml(err.message)}</p>`;
+  } finally {
+    ui.btnCloud.disabled = ui.btnBldg3d.disabled = false;
+  }
+}
+
+function render3d(kind, tileCount, files) {
+  const ds = DATASETS[kind];
+  dl3d.hidden = false;
+  if (!files.length) {
+    dl3d.innerHTML = `<p>Für diesen Ausschnitt gibt es keine Daten von ${escapeHtml(ds.title)}.</p>`;
+    return;
+  }
+  const formats = [...new Set(files.map(f => f.fmt))];
+  const pref = ['DXF', 'DWG', 'GML', 'GDB', 'LAS', 'LAZ'];
+  formats.sort((a, b) => (pref.indexOf(a) + 99) % 99 - (pref.indexOf(b) + 99) % 99);
+  let fmt = formats[0];
+
+  const draw = () => {
+    const list = files.filter(f => f.fmt === fmt);
+    const [minE, minN, maxE, maxN] = getBBox().map(v => Math.round(v));
+    const cropHelp = kind === 'cloud' ? `
+      <details>
+        <summary>Auf den Ausschnitt zuschneiden</summary>
+        <p class="hint">Jede Kachel deckt 1 km² ab. Nach dem Entpacken lässt sich die Punktwolke z.B. mit PDAL auf den Ausschnitt zuschneiden:</p>
+        <pre id="pdalCmd">pdal merge ${list.map(f => escapeHtml(f.name.replace(/\.zip$/, ''))).join(' ')} merged.las
+pdal translate merged.las ausschnitt.laz crop --filters.crop.bounds="([${minE}, ${maxE}], [${minN}, ${maxN}])"</pre>
+        <button id="copyPdal">Befehle kopieren</button>
+      </details>` : '';
+    dl3d.innerHTML = `
+      <div class="dl-head"><span><strong>${escapeHtml(ds.title)}</strong></span><span>${tileCount} ${tileCount === 1 ? ds.unit : ds.units}</span></div>
+      ${formats.length > 1 ? `<label class="inline">Format<select id="fmt3d">${formats.map(f => `<option${f === fmt ? ' selected' : ''}>${escapeHtml(f)}</option>`).join('')}</select></label>` : ''}
+      <ul class="dl-list">
+        ${list.map((f, i) => `<li><a href="${escapeHtml(f.href)}" rel="noopener" title="${escapeHtml(f.name)}">${escapeHtml(f.tile)} (${f.year || 'o. J.'})</a><span class="size" data-i="${i}">${fmtBytes(f.size)}</span></li>`).join('')}
+      </ul>
+      <button id="dlAll">Alle ${list.length} herunterladen</button>
+      <p class="hint">Die Downloads starten einzeln. Erlaubt der Browser nachfragen, mehrere Dateien zuzulassen. Punktwolken-Kacheln sind gross, oft mehrere hundert MB.</p>
+      ${cropHelp}`;
+
+    const sel = $('fmt3d');
+    if (sel) sel.addEventListener('change', () => { fmt = sel.value; draw(); });
+    $('dlAll').addEventListener('click', () => downloadAll(list));
+    const cp = $('copyPdal');
+    if (cp) cp.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText($('pdalCmd').textContent); cp.textContent = 'Kopiert'; }
+      catch (e) { cp.textContent = 'Kopieren nicht möglich'; }
+    });
+    fillSizes(list);
+  };
+  draw();
+}
+
+// Dateigrössen nachladen, falls die API sie nicht mitliefert
+async function fillSizes(list) {
+  const queue = list.map((f, i) => ({ f, i })).filter(x => !x.f.size);
+  const worker = async () => {
+    while (queue.length) {
+      const { f, i } = queue.shift();
+      try {
+        const r = await fetch(f.href, { method: 'HEAD' });
+        f.size = +r.headers.get('Content-Length') || 0;
+      } catch (e) { f.size = 0; }
+      const el = dl3d.querySelector(`.size[data-i="${i}"]`);
+      if (el) el.textContent = fmtBytes(f.size);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+}
+
+// Mehrere Downloads über unsichtbare iframes, damit die Seite nicht verlassen wird
+function downloadAll(list) {
+  list.forEach((f, k) => setTimeout(() => {
+    const fr = document.createElement('iframe');
+    fr.style.display = 'none';
+    fr.src = f.href;
+    document.body.appendChild(fr);
+    setTimeout(() => fr.remove(), 120000);
+  }, k * 1500));
+  setStatus(`${list.length} Downloads werden gestartet …`);
+}
+
+ui.btnCloud = $('btnCloud');
+ui.btnBldg3d = $('btnBldg3d');
+ui.btnCloud.addEventListener('click', () => search3d('cloud'));
+ui.btnBldg3d.addEventListener('click', () => search3d('bldg'));
 
 applyStylePreset();
 updatePerimeter();
