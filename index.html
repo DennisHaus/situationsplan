@@ -53,11 +53,32 @@
         <div class="checks">
           <label><input type="checkbox" id="lyBuildings" checked> Gebäude (Schwarzplan)</label>
           <label><input type="checkbox" id="lyRoads" checked> Strassen und Wege</label>
-          <label><input type="checkbox" id="lyGreen" checked> Grünflächen</label>
+          <label><input type="checkbox" id="lyGreen" checked> Grün- und Wasserflächen</label>
           <label><input type="checkbox" id="lyTrees" checked> Bäume</label>
           <label><input type="checkbox" id="lyParcels" checked> Parzellengrenzen</label>
           <label><input type="checkbox" id="lyParcelNr" checked> Parzellennummern</label>
         </div>
+      </section>
+
+      <section class="group">
+        <h2>Darstellung</h2>
+        <label class="inline">Stil
+          <select id="style">
+            <option value="detail" selected>Detailliert (für 1:500)</option>
+            <option value="simple">Schwarzplan (für 1:1000)</option>
+          </select>
+        </label>
+        <div class="checks">
+          <label><input type="checkbox" id="optRoof" checked> Dachaufsicht (schematisch)</label>
+          <label><input type="checkbox" id="optShadow" checked> Schattenwurf</label>
+          <label><input type="checkbox" id="optTexture" checked> Texturen</label>
+        </div>
+        <label class="inline spaced">Schatten fallen
+          <select id="sun">
+            <option value="ne" selected>nach Nordosten</option>
+            <option value="se">nach Südosten</option>
+          </select>
+        </label>
       </section>
 
       <section class="group">

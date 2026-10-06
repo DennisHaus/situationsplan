@@ -137,6 +137,7 @@ label input, label select { color: var(--ink); font-size: 0.95rem; }
 .checks input { accent-color: var(--ink); width: 16px; height: 16px; }
 
 .inline { margin-bottom: 10px; }
+.spaced { margin-top: 10px; }
 
 button {
   cursor: pointer;
