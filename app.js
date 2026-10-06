@@ -57,7 +57,8 @@ const COL = {
 const $ = id => document.getElementById(id);
 const ui = {
   width: $('width'), height: $('height'), scale: $('scale'), dpi: $('dpi'),
-  style: $('style'), optRoof: $('optRoof'), optShadow: $('optShadow'), optTexture: $('optTexture'), sun: $('sun'),
+  style: $('style'), optRoof: $('optRoof'), optShadow: $('optShadow'), optTexture: $('optTexture'),
+  optTerrain: $('optTerrain'), sun: $('sun'),
   btnGenerate: $('btnGenerate'), btnPng: $('btnPng'), btnDxf: $('btnDxf'),
   status: $('status'), preview: $('preview'), planEmpty: $('planEmpty'),
   tabMap: $('tabMap'), tabPlan: $('tabPlan'), mapView: $('map'), planView: $('planView')
@@ -75,6 +76,7 @@ function renderOpts() {
     roof: ui.optRoof.checked,
     shadow: ui.optShadow.checked,
     texture: ui.optTexture.checked,
+    terrain: ui.optTerrain.checked,
     sun: ui.sun.value
   };
 }
@@ -145,7 +147,8 @@ function applyStylePreset() {
   ui.optRoof.checked = detail;
   ui.optShadow.checked = detail;
   ui.optTexture.checked = detail;
-  setTreeStyle(detail ? 'leaf' : 'line');
+  ui.optTerrain.checked = detail;
+  setTreeStyle(detail ? 'flat' : 'circle');
 }
 
 function setTreeStyle(id) {
@@ -181,7 +184,10 @@ function buildTreePicker() {
   }
 }
 ui.style.addEventListener('change', () => { applyStylePreset(); renderPreview(); });
-[ui.optRoof, ui.optShadow, ui.optTexture].forEach(el => el.addEventListener('change', renderPreview));
+[ui.optRoof, ui.optShadow, ui.optTexture, ui.optTerrain].forEach(el => el.addEventListener('change', renderPreview));
+ui.optTerrain.addEventListener('change', () => {
+  if (ui.optTerrain.checked && state.plan && !state.plan.terrain) setStatus('Für die Geländeschattierung den Plan neu erzeugen.');
+});
 ui.sun.addEventListener('change', () => { buildTreePicker(); renderPreview(); });
 ui.optRoof.addEventListener('change', () => {
   if (ui.optRoof.checked && state.plan && !state.plan.roofsLoaded) {
@@ -868,14 +874,15 @@ async function generate() {
     const needOsm = opts.buildings || opts.roads || opts.green || opts.trees;
     const needParcels = opts.parcels || opts.parcelNr;
     const needRoofs = opts.buildings && ui.optRoof.checked;
+    const needTerrain = opts.green && ui.optTerrain.checked;
     setStatus('');
 
     // Ladefortschritt. Overpass meldet keine Gesamtgrösse, daher dort eine Schätzung
     // aus Wartezeit und empfangener Datenmenge; Parzellen und Dächer zählen echt.
     const load = {
       phase: 'wait', t0: performance.now(), received: 0, total: 0,
-      pages: 0, roofFrac: 0, roofCount: 0,
-      osmDone: !needOsm, parcDone: !needParcels, roofDone: !needRoofs
+      pages: 0, roofFrac: 0, roofCount: 0, terrFrac: 0,
+      osmDone: !needOsm, parcDone: !needParcels, roofDone: !needRoofs, terrDone: !needTerrain
     };
     const areaHa = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / 1e4;
     const expectedBytes = Math.max(4e5, areaHa * 2.5e5);
@@ -891,18 +898,20 @@ async function generate() {
       if (needOsm) parts.push([0.55, o]);
       if (needParcels) parts.push([0.15, p]);
       if (needRoofs) parts.push([0.3, r]);
+      if (needTerrain) parts.push([0.12, load.terrDone ? 1 : load.terrFrac]);
       const wsum = parts.reduce((t, x) => t + x[0], 0) || 1;
       const f = parts.reduce((t, x) => t + x[0] * x[1], 0) / wsum;
       const bits = [];
       if (needOsm && !load.osmDone) bits.push(load.phase === 'wait' ? 'OpenStreetMap stellt Daten zusammen' : `${(load.received / 1e6).toFixed(1)} MB von OpenStreetMap`);
       if (needRoofs && !load.roofDone) bits.push(`${load.roofCount} Dachflächen`);
       if (needParcels && !load.parcDone) bits.push('Parzellen');
+      if (needTerrain && !load.terrDone) bits.push('Höhenmodell');
       progress.set(2 + 58 * f, 'Lade Daten', bits.length ? bits.join(', ') + ' …' : 'Fast fertig …');
     };
     ticker = setInterval(tick, 200);
 
     const warnings = [];
-    const [osm, parcelsRaw, roofsRaw] = await Promise.all([
+    const [osm, parcelsRaw, roofsRaw, terrain] = await Promise.all([
       needOsm
         ? fetchOverpass(wgsBox, {
             onHeaders: total => { load.phase = 'bytes'; load.total = total; },
@@ -919,7 +928,12 @@ async function generate() {
         ? fetchRoofs(roofBox, (frac, count) => { load.roofFrac = frac; load.roofCount = count; })
             .catch(err => { warnings.push('Echte Dachformen nicht verfügbar, Dächer schematisch (' + err.message + ').'); return []; })
             .then(r => { load.roofDone = true; return r; })
-        : Promise.resolve([])
+        : Promise.resolve([]),
+      needTerrain
+        ? fetchTerrain(bbox, frac => { load.terrFrac = frac; })
+            .catch(err => { warnings.push('Höhenmodell nicht verfügbar, ohne Geländeschattierung (' + err.message + ').'); return null; })
+            .then(r => { load.terrDone = true; return r; })
+        : Promise.resolve(null)
     ]);
     clearInterval(ticker); ticker = null;
 
@@ -930,7 +944,7 @@ async function generate() {
     const plan = {
       bbox, scale, buildings: [], green: [], roadAreas: [], roadLines: [],
       trees: [], parcels: [], labels: [], rails: [], zebras: [], passages: [], arcades: [],
-      roofFaces: [], roofOutlines: [], roofsLoaded: needRoofs
+      roofFaces: [], roofOutlines: [], roofsLoaded: needRoofs, terrain
     };
 
     if (opts.buildings) {
@@ -1177,201 +1191,321 @@ function mottle(c, W, H, cell, seed, dark, light, amp) {
 
 /* ---------- Bäume ---------- */
 
+// Angelehnt an gängige Darstellungen in Situationsplänen:
+// drei gerenderte Varianten (Bild) und zwei reine Strichzeichnungen (Vektor)
 const TREE_STYLES = [
-  { id: 'leaf', label: 'Laubkrone', kind: 'Bild' },
-  { id: 'water', label: 'Aquarell', kind: 'Bild' },
-  { id: 'conifer', label: 'Nadelbaum', kind: 'Bild' },
-  { id: 'line', label: 'Linie', kind: 'Vektor' },
-  { id: 'cloud', label: 'Wolke', kind: 'Vektor' }
+  { id: 'flat', label: 'Flach', kind: 'Bild' },
+  { id: 'grey', label: 'Grau', kind: 'Bild' },
+  { id: 'fine', label: 'Laub', kind: 'Bild' },
+  { id: 'circle', label: 'Kreis', kind: 'Vektor' },
+  { id: 'branch', label: 'Astwerk', kind: 'Vektor' }
 ];
-const RASTER_TREES = new Set(['leaf', 'water', 'conifer']);
-let treeStyle = 'leaf';
+const RASTER_TREES = new Set(['flat', 'grey', 'fine']);
+const MULTIPLY_TREES = new Set(['flat', 'grey']); // Überlappungen dunkeln ab wie Marker
+let treeStyle = 'flat';
 const spriteCache = new Map();
 
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
 
-// Gerenderte Baumbilder, zwischengespeichert nach Stil, Grösse, Variante und Sonnenstand
 function treeSprite(style, rpx, variant, sun) {
   const rb = Math.max(4, Math.round(rpx / 3) * 3);
   const key = `${style}|${rb}|${variant}|${sun.toSun.join()}`;
   let sp = spriteCache.get(key);
   if (sp) return sp;
   if (spriteCache.size > 500) spriteCache.clear();
-  const pad = Math.ceil(rb * 0.2) + 2, S = 2 * (rb + pad);
+  const pad = Math.ceil(rb * 0.12) + 2, S = 2 * (rb + pad);
   const cv = document.createElement('canvas');
   cv.width = cv.height = S;
   const c = cv.getContext('2d');
   const rnd = mulberry32(variant * 7919 + rb * 31 + style.length * 1013);
-  const lx = sun.toSun[0], ly = -sun.toSun[1]; // Lichtrichtung in Bildkoordinaten
-  if (style === 'leaf') paintLeaf(c, S / 2, S / 2, rb, rnd, lx, ly);
-  else if (style === 'water') paintWatercolor(c, S / 2, S / 2, rb, rnd, lx, ly);
-  else paintConifer(c, S / 2, S / 2, rb, rnd, lx, ly);
+  const lx = sun.toSun[0], ly = -sun.toSun[1];
+  if (style === 'flat') paintFlat(c, S / 2, S / 2, rb, rnd, lx, ly);
+  else if (style === 'grey') paintGrey(c, S / 2, S / 2, rb, rnd, lx, ly);
+  else paintFine(c, S / 2, S / 2, rb, rnd, lx, ly);
   sp = { canvas: cv, scale: rpx / rb };
   spriteCache.set(key, sp);
   return sp;
 }
 
-function paintLeaf(c, cx, cy, R, rnd, lx, ly) {
-  // dunkler Kern, darüber Blattbüschel, beleuchtete Büschel zuletzt
-  c.fillStyle = 'rgba(46,72,40,0.95)';
-  c.beginPath(); c.arc(cx, cy, R * 0.72, 0, Math.PI * 2); c.fill();
-  const n = Math.min(110, Math.round(26 + R * 0.7));
-  const blobs = [];
-  for (let i = 0; i < n; i++) {
-    const a = rnd() * Math.PI * 2, d = R * 0.8 * Math.sqrt(rnd());
-    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
-    const lit = ((x - cx) * lx + (y - cy) * ly) / R + (rnd() - 0.5) * 0.5;
-    blobs.push({ x, y, r: R * (0.17 + rnd() * 0.15), lit });
-  }
-  blobs.sort((p, q) => p.lit - q.lit);
-  for (const b of blobs) {
-    const t = Math.max(0, Math.min(1, (b.lit + 1) / 2));
-    const col = mix([58, 88, 46], [158, 190, 112], t);
-    const g = c.createRadialGradient(b.x + lx * b.r * 0.35, b.y + ly * b.r * 0.35, b.r * 0.05, b.x, b.y, b.r);
-    g.addColorStop(0, rgba(mix(col, [235, 245, 200], 0.35), 1));
-    g.addColorStop(0.65, rgba(col, 1));
-    g.addColorStop(1, rgba(mix(col, [30, 50, 28], 0.4), 0));
-    c.fillStyle = g;
-    c.beginPath(); c.arc(b.x, b.y, b.r, 0, Math.PI * 2); c.fill();
-  }
-  const m = Math.min(700, Math.round(R * R * 0.3));
-  const sz = Math.max(0.7, R * 0.022);
-  for (let i = 0; i < m; i++) {
-    const a = rnd() * Math.PI * 2, d = R * 0.95 * Math.sqrt(rnd());
-    c.fillStyle = rnd() < 0.5 ? 'rgba(230,242,190,0.35)' : 'rgba(30,52,26,0.3)';
-    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz);
-  }
-}
-
-function paintWatercolor(c, cx, cy, R, rnd, lx, ly) {
-  const blob = (rad, ox, oy, wob) => {
-    const ph = [rnd() * 6.3, rnd() * 6.3, rnd() * 6.3];
-    c.beginPath();
-    for (let i = 0; i <= 64; i++) {
-      const a = i / 64 * Math.PI * 2;
-      const k = rad * (1 + wob * (0.5 * Math.sin(3 * a + ph[0]) + 0.3 * Math.sin(5 * a + ph[1]) + 0.2 * Math.sin(8 * a + ph[2])) + (rnd() - 0.5) * wob * 0.3 * rad / rad);
-      const x = cx + ox + Math.cos(a) * k, y = cy + oy + Math.sin(a) * k;
-      i ? c.lineTo(x, y) : c.moveTo(x, y);
-    }
-    c.closePath();
-  };
-  for (let i = 0; i < 5; i++) {
-    blob(R * (0.86 + rnd() * 0.12), (rnd() - 0.5) * R * 0.1, (rnd() - 0.5) * R * 0.1, 0.09);
-    c.fillStyle = 'rgba(112,158,104,0.2)';
-    c.fill();
-    c.strokeStyle = 'rgba(62,108,70,0.22)'; // dunklerer Rand wie getrocknete Farbe
-    c.lineWidth = Math.max(0.8, R * 0.035);
-    c.stroke();
-  }
-  // Schattenseite und Lichtseite
-  blob(R * 0.55, -lx * R * 0.28, -ly * R * 0.28, 0.12);
-  c.fillStyle = 'rgba(52,96,72,0.22)'; c.fill();
-  blob(R * 0.45, lx * R * 0.3, ly * R * 0.3, 0.14);
-  c.fillStyle = 'rgba(214,232,170,0.35)'; c.fill();
-  // Pigmentkörnung
-  const m = Math.min(500, Math.round(R * R * 0.18));
-  for (let i = 0; i < m; i++) {
-    const a = rnd() * Math.PI * 2, d = R * 0.9 * Math.sqrt(rnd());
-    c.fillStyle = `rgba(40,80,50,${0.08 + rnd() * 0.12})`;
-    const sz = Math.max(0.6, R * 0.018);
-    c.fillRect(cx + Math.cos(a) * d, cy + Math.sin(a) * d, sz, sz);
-  }
-}
-
-function paintConifer(c, cx, cy, R, rnd, lx, ly) {
-  const spikes = 13 + Math.floor(rnd() * 5);
+// Leicht unregelmässiger Kronenumriss
+function crownPath(c, cx, cy, rad, amp, rnd) {
+  const p1 = rnd() * 6.3, p2 = rnd() * 6.3;
   c.beginPath();
-  for (let i = 0; i <= spikes * 2; i++) {
-    const a = i / (spikes * 2) * Math.PI * 2;
-    const k = i % 2 ? R * (0.62 + rnd() * 0.1) : R * (0.9 + rnd() * 0.1);
+  for (let i = 0; i <= 90; i++) {
+    const a = i / 90 * Math.PI * 2;
+    const k = rad * (1 + amp * (0.6 * Math.sin(5 * a + p1) + 0.4 * Math.sin(9 * a + p2)));
     const x = cx + Math.cos(a) * k, y = cy + Math.sin(a) * k;
     i ? c.lineTo(x, y) : c.moveTo(x, y);
   }
   c.closePath();
-  c.fillStyle = 'rgba(34,62,44,0.95)';
-  c.fill();
-  const n = Math.min(260, Math.round(R * 5));
-  c.lineCap = 'round';
-  for (let i = 0; i < n; i++) {
-    const a = rnd() * Math.PI * 2;
-    const r0 = R * (0.05 + rnd() * 0.3), r1 = R * (0.6 + rnd() * 0.38);
-    const lit = Math.cos(a) * lx + Math.sin(a) * ly;
-    const col = mix([30, 60, 42], [128, 168, 110], Math.max(0, Math.min(1, (lit + 1) / 2 + (rnd() - 0.5) * 0.3)));
-    c.strokeStyle = rgba(col, 0.75);
-    c.lineWidth = Math.max(0.6, R * (0.02 + rnd() * 0.02));
-    const bend = (rnd() - 0.5) * 0.25;
-    c.beginPath();
-    c.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
-    c.quadraticCurveTo(cx + Math.cos(a + bend) * (r0 + r1) / 2, cy + Math.sin(a + bend) * (r0 + r1) / 2,
-      cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
-    c.stroke();
-  }
-  c.fillStyle = 'rgba(70,52,36,0.9)';
-  c.beginPath(); c.arc(cx, cy, Math.max(0.8, R * 0.06), 0, Math.PI * 2); c.fill();
 }
 
-// Vektorbäume als Geometrie relativ zum Stammpunkt (Einheiten frei, y nach oben)
+// Flache, ruhige Krone in gedecktem Grün mit feinen Innenbögen
+function paintFlat(c, cx, cy, R, rnd, lx, ly) {
+  crownPath(c, cx, cy, R * 0.97, 0.02, rnd);
+  const g = c.createRadialGradient(cx + lx * R * 0.4, cy + ly * R * 0.4, R * 0.05, cx, cy, R);
+  g.addColorStop(0, 'rgb(190,207,168)');
+  g.addColorStop(1, 'rgb(146,170,128)');
+  c.fillStyle = g;
+  c.fill();
+  c.lineWidth = Math.max(1, R * 0.035);
+  c.strokeStyle = 'rgb(92,118,82)';
+  c.stroke();
+  c.lineCap = 'round';
+  c.strokeStyle = 'rgba(92,118,82,0.45)';
+  c.lineWidth = Math.max(0.7, R * 0.022);
+  for (let i = 0; i < 5; i++) {
+    const rr = R * (0.32 + rnd() * 0.45), a0 = rnd() * Math.PI * 2;
+    c.beginPath(); c.arc(cx, cy, rr, a0, a0 + 0.7 + rnd() * 0.9); c.stroke();
+  }
+  c.fillStyle = 'rgb(92,118,82)';
+  c.beginPath(); c.arc(cx, cy, Math.max(1, R * 0.05), 0, Math.PI * 2); c.fill();
+}
+
+// Transparente graue Krone, wie in Schwarzplänen üblich
+function paintGrey(c, cx, cy, R, rnd, lx, ly) {
+  crownPath(c, cx, cy, R * 0.98, 0.012, rnd);
+  c.fillStyle = 'rgba(150,150,146,0.5)';
+  c.fill();
+  c.lineWidth = Math.max(1, R * 0.03);
+  c.strokeStyle = 'rgba(64,64,62,0.85)';
+  c.stroke();
+  // heller Glanzbogen auf der Lichtseite
+  const a = Math.atan2(ly, lx);
+  c.lineCap = 'round';
+  c.strokeStyle = 'rgba(255,255,255,0.55)';
+  c.lineWidth = Math.max(1, R * 0.06);
+  c.beginPath(); c.arc(cx, cy, R * 0.72, a - 0.7, a + 0.7); c.stroke();
+  c.fillStyle = 'rgba(64,64,62,0.9)';
+  c.beginPath(); c.arc(cx, cy, Math.max(1, R * 0.05), 0, Math.PI * 2); c.fill();
+}
+
+// Feines Laub in gedeckten Tönen, klare Büschel ohne Weichzeichnung
+function paintFine(c, cx, cy, R, rnd, lx, ly) {
+  crownPath(c, cx, cy, R * 0.9, 0.03, rnd);
+  c.fillStyle = 'rgb(100,124,90)';
+  c.fill();
+  const n = Math.min(170, Math.round(40 + R * 1.2));
+  const blobs = [];
+  for (let i = 0; i < n; i++) {
+    const a = rnd() * Math.PI * 2, d = R * 0.86 * Math.sqrt(rnd());
+    const x = cx + Math.cos(a) * d, y = cy + Math.sin(a) * d;
+    const lit = ((x - cx) * lx + (y - cy) * ly) / R + (rnd() - 0.5) * 0.45;
+    blobs.push({ x, y, r: R * (0.09 + rnd() * 0.08), lit });
+  }
+  blobs.sort((p, q) => p.lit - q.lit);
+  for (const b of blobs) {
+    const col = mix([94, 118, 84], [192, 206, 164], Math.max(0, Math.min(1, (b.lit + 1) / 2)));
+    c.fillStyle = rgba(col, 1);
+    c.beginPath(); c.arc(b.x, b.y, b.r, 0, Math.PI * 2); c.fill();
+    c.fillStyle = rgba(mix(col, [240, 244, 222], 0.35), 0.8);
+    c.beginPath(); c.arc(b.x + lx * b.r * 0.3, b.y + ly * b.r * 0.3, b.r * 0.55, 0, Math.PI * 2); c.fill();
+  }
+  crownPath(c, cx, cy, R * 0.97, 0.03, rnd);
+  c.lineWidth = Math.max(0.8, R * 0.02);
+  c.strokeStyle = 'rgba(70,92,62,0.55)';
+  c.stroke();
+}
+
+// Vektorbäume relativ zum Stammpunkt (y nach oben). lines: [a, b, Stufe]
 function treeVector(style, r, seed) {
   const rnd = mulberry32(seed + 17);
-  if (style === 'line') {
-    const lines = [];
-    const n = 6 + Math.floor(rnd() * 3), ph = rnd() * Math.PI * 2;
-    const P = (a, k) => [Math.cos(a) * r * k, Math.sin(a) * r * k];
-    for (let i = 0; i < n; i++) {
-      const a = ph + i * Math.PI * 2 / n + (rnd() - 0.5) * 0.3;
-      const fork = P(a, 0.5 + rnd() * 0.1);
-      lines.push([P(a, 0.12), fork]);
-      lines.push([fork, P(a - 0.22, 0.8)]);
-      lines.push([fork, P(a + 0.22, 0.8)]);
-    }
-    return { circles: [r], dot: r * 0.08, rings: [], lines };
+  if (style === 'circle') {
+    const k = r * 0.12;
+    return { circles: [r], lines: [[[-k, 0], [k, 0], 1], [[0, -k], [0, k], 1]] };
   }
-  const lobes = 9 + Math.floor(rnd() * 4), ph = rnd() * Math.PI * 2;
-  const pts = [];
-  for (let k = 0; k < lobes; k++) {
-    const a0 = ph + k * Math.PI * 2 / lobes, a1 = ph + (k + 1) * Math.PI * 2 / lobes;
-    const amp = 0.09 + rnd() * 0.05;
-    for (let j = 0; j < 8; j++) {
-      const u = j / 8, a = a0 + (a1 - a0) * u;
-      const rr = r * (1 - amp + amp * Math.sin(Math.PI * u));
-      pts.push([Math.cos(a) * rr, Math.sin(a) * rr]);
+  const lines = [];
+  const grow = (p, ang, len, level) => {
+    const q = [p[0] + Math.cos(ang) * len, p[1] + Math.sin(ang) * len];
+    lines.push([p, q, level]);
+    if (level >= 3) return;
+    const n = level === 0 ? 2 + (rnd() < 0.5 ? 1 : 0) : 2;
+    for (let k = 0; k < n; k++) {
+      const da = (k - (n - 1) / 2) * (0.5 + rnd() * 0.25) + (rnd() - 0.5) * 0.2;
+      grow(q, ang + da, len * (0.62 + rnd() * 0.12), level + 1);
     }
+  };
+  const mains = 5 + Math.floor(rnd() * 2), ph = rnd() * Math.PI * 2;
+  for (let m = 0; m < mains; m++) {
+    const a = ph + m * Math.PI * 2 / mains + (rnd() - 0.5) * 0.4;
+    grow([Math.cos(a) * r * 0.05, Math.sin(a) * r * 0.05], a, r * 0.36, 0);
   }
-  pts.push(pts[0]);
-  return { circles: [], dot: r * 0.06, rings: [pts], lines: [] };
+  return { circles: [r], lines };
 }
 
 function drawTree(c, style, x, y, rpx, seed, mm, sun) {
   if (RASTER_TREES.has(style)) {
     const sp = treeSprite(style, rpx, seed % 4, sun);
     const S = sp.canvas.width * sp.scale;
+    c.save();
+    if (MULTIPLY_TREES.has(style)) c.globalCompositeOperation = 'multiply';
     c.drawImage(sp.canvas, x - S / 2, y - S / 2, S, S);
+    c.restore();
     return;
   }
   const g = treeVector(style, rpx, seed);
-  if (style === 'cloud') {
+  c.save();
+  c.lineCap = 'round';
+  c.beginPath(); c.arc(x, y, rpx, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255,255,255,0.6)'; c.fill();
+  c.strokeStyle = '#1f1f1e';
+  c.lineWidth = mm(style === 'circle' ? 0.15 : 0.1);
+  c.stroke();
+  const widths = style === 'circle' ? [0.1, 0.1] : [0.14, 0.1, 0.07, 0.05];
+  for (const [a, b, lv] of g.lines) {
+    c.lineWidth = Math.max(0.5, mm(widths[Math.min(lv, widths.length - 1)]));
+    c.beginPath(); c.moveTo(x + a[0], y - a[1]); c.lineTo(x + b[0], y - b[1]); c.stroke();
+  }
+  c.restore();
+}
+
+/* ---------- Wiesensignatur und Gelände ---------- */
+
+function hash2(i, j, s = 0) {
+  let h = (Math.imul(i, 374761393) + Math.imul(j, 668265263) + Math.imul(s, 1442695041)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+// Punktsignatur als Vektoren: ein Punkt pro Rasterzelle (in Papier-mm), zufällig versetzt.
+// Die Lage hängt an Weltkoordinaten, darum sehen Vorschau und Export gleich aus.
+function stipple(c, plan, pxPerM, mm, kind) {
+  const [minE, minN, maxE, maxN] = plan.bbox;
+  let step = (kind === 'forest' ? 2.4 : 1.6) * plan.scale / 1000;
+  while (((maxE - minE) / step) * ((maxN - minN) / step) > 350000) step *= 1.25;
+  const X = e => (e - minE) * pxPerM, Y = n => (maxN - n) * pxPerM;
+  const i0 = Math.floor(minE / step), i1 = Math.ceil(maxE / step);
+  const j0 = Math.floor(minN / step), j1 = Math.ceil(maxN / step);
+  if (kind === 'forest') {
+    c.strokeStyle = 'rgba(58,88,52,0.55)';
+    c.lineWidth = Math.max(0.5, mm(0.08));
+    const r = Math.max(1, mm(0.45));
     c.beginPath();
-    g.rings[0].forEach(([px, py], i) => i ? c.lineTo(x + px, y - py) : c.moveTo(x + px, y - py));
-    c.closePath();
-    c.fillStyle = 'rgba(198,220,180,0.93)';
-    c.fill();
-    c.strokeStyle = '#2f4a2a';
-    c.lineWidth = mm(0.13);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      const px = X((i + 0.15 + 0.7 * hash2(i, j, 3)) * step), py = Y((j + 0.15 + 0.7 * hash2(i, j, 4)) * step);
+      const rr = r * (0.7 + 0.6 * hash2(i, j, 5));
+      c.moveTo(px + rr, py); c.arc(px, py, rr, 0, Math.PI * 2);
+    }
     c.stroke();
-    c.beginPath(); c.arc(x, y, Math.max(mm(0.3), g.dot), 0, Math.PI * 2);
-    c.fillStyle = '#2f4a2a'; c.fill();
     return;
   }
-  c.beginPath(); c.arc(x, y, rpx, 0, Math.PI * 2);
-  c.fillStyle = 'rgba(255,255,255,0.55)'; c.fill();
-  c.strokeStyle = '#1f1f1e'; c.lineWidth = mm(0.13); c.stroke();
-  c.lineWidth = mm(0.08);
-  c.lineCap = 'round';
+  const r = Math.max(0.45, mm(0.1));
+  c.fillStyle = 'rgba(72,104,62,0.6)';
   c.beginPath();
-  for (const [a, b] of g.lines) { c.moveTo(x + a[0], y - a[1]); c.lineTo(x + b[0], y - b[1]); }
+  const tufts = [];
+  for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+    const px = X((i + 0.1 + 0.8 * hash2(i, j, 1)) * step), py = Y((j + 0.1 + 0.8 * hash2(i, j, 2)) * step);
+    if (hash2(i, j, 9) < 0.04) { tufts.push([px, py]); continue; }
+    c.moveTo(px + r, py); c.arc(px, py, r, 0, Math.PI * 2);
+  }
+  c.fill();
+  // vereinzelte Grasbüschel
+  c.strokeStyle = 'rgba(72,104,62,0.7)';
+  c.lineWidth = Math.max(0.5, mm(0.08));
+  c.lineCap = 'round';
+  const L = mm(0.7);
+  c.beginPath();
+  for (const [px, py] of tufts) {
+    for (const a of [-0.45, 0, 0.45]) {
+      c.moveTo(px, py);
+      c.lineTo(px + Math.sin(a) * L, py - Math.cos(a) * L);
+    }
+  }
   c.stroke();
-  c.beginPath(); c.arc(x, y, Math.max(mm(0.3), g.dot), 0, Math.PI * 2); c.stroke();
+}
+
+// Höhengitter aus dem swisstopo-Höhenmodell über den Profil-Dienst: eine Linie pro Zeile
+async function fetchTerrain(bbox, onProgress) {
+  const [minE, minN, maxE, maxN] = bbox;
+  const w = maxE - minE, h = maxN - minN;
+  const cols = clamp(Math.round(w / 10) + 1, 12, 80);
+  const rows = clamp(Math.round(h / 10) + 1, 10, 60);
+  const z = new Float32Array(cols * rows);
+  const okRows = new Set();
+  let done = 0;
+  const one = async j => {
+    const n = maxN - j * h / (rows - 1); // Zeile 0 = Norden
+    const geom = JSON.stringify({ type: 'LineString', coordinates: [[minE, n], [maxE, n]] });
+    const url = 'https://api3.geo.admin.ch/rest/services/profile.json' +
+      `?geom=${encodeURIComponent(geom)}&sr=2056&nb_points=${cols}`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const pts = await r.json();
+    const vals = (Array.isArray(pts) ? pts : []).map(p => {
+      const a = p.alts || {};
+      return a.DTM2 != null ? a.DTM2 : a.COMB != null ? a.COMB : a.DTM25;
+    }).filter(v => isFinite(v));
+    if (vals.length < 2) throw new Error('leer');
+    for (let i = 0; i < cols; i++) {
+      const t = i / (cols - 1) * (vals.length - 1), k = Math.floor(t), f = t - k;
+      z[j * cols + i] = vals[k] * (1 - f) + vals[Math.min(k + 1, vals.length - 1)] * f;
+    }
+    okRows.add(j);
+  };
+  const queue = Array.from({ length: rows }, (_, j) => j);
+  const worker = async () => {
+    while (queue.length) {
+      const j = queue.shift();
+      try { await one(j); } catch (e) { /* Zeile später auffüllen */ }
+      done++;
+      if (onProgress) onProgress(done / rows);
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  if (okRows.size < rows / 2) throw new Error('Höhendaten nicht erreichbar');
+  for (let j = 0; j < rows; j++) {
+    if (okRows.has(j)) continue;
+    let best = -1;
+    for (const k of okRows) if (best < 0 || Math.abs(k - j) < Math.abs(best - j)) best = k;
+    z.copyWithin(j * cols, best * cols, best * cols + cols);
+  }
+  return { cols, rows, z };
+}
+
+// Geländeschattierung: Hangschattierung (überhöht, damit auch sanftes Gelände lesbar wird)
+// plus leichter Verlauf nach Höhe; hell auf Kuppen und Sonnenhängen, dunkler in Mulden.
+function terrainShade(c, plan, pxPerM, sun) {
+  const T = plan.terrain;
+  if (!T) return;
+  const { cols, rows, z } = T;
+  const [minE, minN, maxE, maxN] = plan.bbox;
+  const dx = (maxE - minE) / (cols - 1), dy = (maxN - minN) / (rows - 1);
+  const at = (i, j) => z[clamp(j, 0, rows - 1) * cols + clamp(i, 0, cols - 1)];
+  let zmin = Infinity, zmax = -Infinity;
+  const gx = new Float32Array(cols * rows), gy = new Float32Array(cols * rows), mags = [];
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const k = j * cols + i, v = z[k];
+    if (v < zmin) zmin = v; if (v > zmax) zmax = v;
+    gx[k] = (at(i + 1, j) - at(i - 1, j)) / ((Math.min(i + 1, cols - 1) - Math.max(i - 1, 0)) * dx);
+    gy[k] = (at(i, j - 1) - at(i, j + 1)) / ((Math.min(j + 1, rows - 1) - Math.max(j - 1, 0)) * dy); // nach Norden
+    mags.push(Math.hypot(gx[k], gy[k]));
+  }
+  mags.sort((a, b) => a - b);
+  const p90 = mags[Math.floor(mags.length * 0.9)] || 0;
+  const ex = clamp(0.3 / (p90 || 1e-3), 1, 8);
+  const ca = Math.cos(Math.PI / 4), sa = Math.sin(Math.PI / 4);
+  const L = [sun.toSun[0] * ca, sun.toSun[1] * ca, sa];
+  const nc = document.createElement('canvas');
+  nc.width = cols; nc.height = rows;
+  const x = nc.getContext('2d');
+  const img = x.createImageData(cols, rows);
+  for (let k = 0; k < cols * rows; k++) {
+    const nx = -ex * gx[k], ny = -ex * gy[k], nz = 1, nl = Math.hypot(nx, ny, nz);
+    const s = (nx * L[0] + ny * L[1] + nz * L[2]) / nl - L[2];
+    const e = (z[k] - zmin) / ((zmax - zmin) || 1) - 0.5;
+    const t = s * 1.8 + e * 0.22;
+    const col = t > 0 ? [255, 255, 245] : [38, 66, 34];
+    img.data[k * 4] = col[0]; img.data[k * 4 + 1] = col[1]; img.data[k * 4 + 2] = col[2];
+    img.data[k * 4 + 3] = Math.round(Math.min(0.5, Math.abs(t)) * 255);
+  }
+  x.putImageData(img, 0, 0);
+  c.save();
+  c.imageSmoothingEnabled = true;
+  c.imageSmoothingQuality = 'high';
+  c.drawImage(nc, -0.5 * dx * pxPerM, -0.5 * dy * pxPerM, cols * dx * pxPerM, rows * dy * pxPerM);
+  c.restore();
 }
 
 /* ---------- Plan zeichnen ---------- */
@@ -1444,26 +1578,13 @@ function drawPlan(canvas, plan, dpi, o) {
   // Wasser
   fillStroke(ctx, greens('water'), COL.water, COL.waterEdge, mm(0.15));
 
-  // Wiese: grosse und kleine Flecken, zwei gedrehte Halmmuster
-  const grassTex = o.texture ? c => {
-    mottle(c, W, H, mm(11), 11, [70, 108, 52], [250, 252, 236], 0.3);
-    mottle(c, W, H, mm(3.2), 12, [70, 108, 52], [250, 252, 236], 0.14);
-    const p1 = makePattern(ctx, dpi, 'grass', 0);
-    const p2 = makePattern(ctx, dpi, 'grass', 1);
-    p1.setTransform(new DOMMatrix().rotate(13));
-    p2.setTransform(new DOMMatrix().translate(mm(5), mm(11)).rotate(-29));
-    c.fillStyle = p1; c.fillRect(0, 0, W, H);
-    c.fillStyle = p2; c.fillRect(0, 0, W, H);
+  // Wiese und Wald: Geländeschattierung und Punktsignatur nur auf den Grünflächen
+  const greenTex = kind => (o.texture || (o.terrain && plan.terrain)) ? c => {
+    if (o.terrain) terrainShade(c, plan, pxPerM, sun);
+    if (o.texture) stipple(c, plan, pxPerM, mm, kind);
   } : null;
-  composite(c => fillStroke(c, greens('grass'), COL.grass, COL.grassEdge, mm(0.13)), grassTex);
-
-  const forestTex = o.texture ? c => {
-    mottle(c, W, H, mm(8), 21, [40, 72, 36], [236, 246, 222], 0.3);
-    const pf = makePattern(ctx, dpi, 'forest');
-    pf.setTransform(new DOMMatrix().rotate(21));
-    c.fillStyle = pf; c.fillRect(0, 0, W, H);
-  } : null;
-  composite(c => fillStroke(c, greens('forest'), COL.forest, COL.forestEdge, mm(0.13)), forestTex);
+  composite(c => fillStroke(c, greens('grass'), COL.grass, COL.grassEdge, mm(0.13)), greenTex('grass'));
+  composite(c => fillStroke(c, greens('forest'), COL.forest, COL.forestEdge, mm(0.13)), greenTex('forest'));
 
   // Schotterbett der Eisenbahn
   for (const r of plan.rails) {
@@ -1993,14 +2114,9 @@ async function buildDXF(plan, o) {
   for (const t of plan.trees) {
     if (t.e < minE || t.e > maxE || t.n < minN || t.n > maxN) continue;
     const r = t.d / 2;
-    if (treeStyle === 'cloud') {
-      const gm = treeVector('cloud', r, t.seed);
-      pline('BAEUME', gm.rings[0].map(([x, y]) => [t.e + x, t.n + y]));
-    } else {
-      g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r));
-      if (treeStyle === 'line') {
-        for (const [a, b] of treeVector('line', r, t.seed).lines) line('BAEUME', [t.e + a[0], t.n + a[1]], [t.e + b[0], t.n + b[1]]);
-      }
+    g(0, 'CIRCLE'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0'); g(40, f(r));
+    if (!RASTER_TREES.has(treeStyle)) {
+      for (const [a, b] of treeVector(treeStyle, r, t.seed).lines) line('BAEUME', [t.e + a[0], t.n + a[1]], [t.e + b[0], t.n + b[1]]);
     }
     g(0, 'POINT'); g(8, 'BAEUME'); g(10, f(t.e)); g(20, f(t.n)); g(30, '0.0');
   }
